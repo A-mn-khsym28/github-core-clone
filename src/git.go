@@ -242,8 +242,7 @@ func (r *Repo) buildLsRefsLocked(peel, symrefs, unborn bool, prefixes []string) 
 
 // ---------- Git HTTP Handlers ----------
 
-func (srv *Server) handleGitInfoRefs(owner, repoName, query, gitProto []byte) []byte {
-	r := srv.store.GetRepoBytes(owner, repoName)
+func (srv *Server) handleGitInfoRefs(r *Repo, query, gitProto []byte) []byte {
 	if r == nil {
 		return respNotFoundJSON
 	}
@@ -268,8 +267,7 @@ func (srv *Server) handleGitInfoRefs(owner, repoName, query, gitProto []byte) []
 	return respNotFoundJSON
 }
 
-func (srv *Server) handleGitUploadPack(owner, repoName, gitProto, body []byte) []byte {
-	r := srv.store.GetRepoBytes(owner, repoName)
+func (srv *Server) handleGitUploadPack(r *Repo, gitProto, body []byte) []byte {
 	if r == nil {
 		return respNotFoundJSON
 	}
@@ -364,11 +362,11 @@ func (srv *Server) handleUploadPackV2(r *Repo, body []byte) []byte {
 		resp := r.buildLsRefsLocked(peel, symrefs, unborn, prefixes)
 		r.mu.RUnlock()
 		httpResp := buildRawHTTPResponse(200, "OK", "application/x-git-upload-pack-result", resp)
+		reqCopy := make([]byte, len(body))
+		copy(reqCopy, body)
+		r.lsRefsReqCache.Store(&RawReqRespCache{ReqBody: reqCopy, HTTPResp: httpResp})
 		if len(prefixes) == 0 && peel && symrefs && unborn {
-			reqCopy := make([]byte, len(body))
-			copy(reqCopy, body)
 			r.lsRefsCache.Store(&httpResp)
-			r.lsRefsReqCache.Store(&RawReqRespCache{ReqBody: reqCopy, HTTPResp: httpResp})
 		}
 		return httpResp
 
@@ -429,15 +427,17 @@ func (srv *Server) handleUploadPackV2(r *Repo, body []byte) []byte {
 		resp = append(resp, "0000"...)
 		httpResp := buildRawHTTPResponse(200, "OK", "application/x-git-upload-pack-result", resp)
 
-		if len(wants) == 1 && len(haves) == 0 && len(clientShallows) == 0 && depth == 1 && filter == "" {
+		if len(haves) == 0 && len(clientShallows) == 0 {
 			reqCopy := make([]byte, len(body))
 			copy(reqCopy, body)
-			r.shallowFetchCache.Store(&ShallowFetchCache{
-				WantOID:  wants[0],
-				Depth:    1,
-				HTTPResp: httpResp,
-			})
 			r.fetchReqCache.Store(&RawReqRespCache{ReqBody: reqCopy, HTTPResp: httpResp})
+			if len(wants) == 1 && depth == 1 && filter == "" {
+				r.shallowFetchCache.Store(&ShallowFetchCache{
+					WantOID:  wants[0],
+					Depth:    1,
+					HTTPResp: httpResp,
+				})
+			}
 		}
 		return httpResp
 
@@ -742,8 +742,7 @@ type pushCmd struct {
 	ref    string
 }
 
-func (srv *Server) handleGitReceivePack(owner, repoName, body []byte) []byte {
-	r := srv.store.GetRepoBytes(owner, repoName)
+func (srv *Server) handleGitReceivePack(r *Repo, body []byte) []byte {
 	if r == nil {
 		return respNotFoundJSON
 	}
@@ -751,7 +750,8 @@ func (srv *Server) handleGitReceivePack(owner, repoName, body []byte) []byte {
 		return respBadRequestJSON
 	}
 
-	var cmds []pushCmd
+	var cmdsBuf [2]pushCmd
+	cmds := cmdsBuf[:0]
 	wantReport := false
 	wantSideband := false
 	pos := 0
@@ -792,10 +792,17 @@ func (srv *Server) handleGitReceivePack(owner, repoName, body []byte) []byte {
 		if !ok1 || !ok2 {
 			return respBadRequestJSON
 		}
+		refBytes := line[82:]
+		var refName string
+		if len(refBytes) == 15 && string(refBytes) == "refs/heads/main" {
+			refName = "refs/heads/main"
+		} else {
+			refName = string(refBytes)
+		}
 		cmds = append(cmds, pushCmd{
 			oldOID: oldOID,
 			newOID: newOID,
-			ref:    string(line[82:]),
+			ref:    refName,
 		})
 	}
 
@@ -812,7 +819,13 @@ func (srv *Server) handleGitReceivePack(owner, repoName, body []byte) []byte {
 		ok     bool
 		reason string
 	}
-	reports := make([]refReport, len(cmds))
+	var reportsBuf [2]refReport
+	var reports []refReport
+	if len(cmds) <= len(reportsBuf) {
+		reports = reportsBuf[:len(cmds)]
+	} else {
+		reports = make([]refReport, len(cmds))
+	}
 	changed := false
 
 	if unpackErr != nil {

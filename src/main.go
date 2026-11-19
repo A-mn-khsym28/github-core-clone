@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -31,19 +30,18 @@ func main() {
 	store := NewStore(viewerLogin, token)
 	srv := NewServer(store)
 
-	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4zero, Port: 0})
+	listenFD, port, err := listenRawTCP()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[forge] listen failed: %v\n", err)
 		os.Exit(1)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	doneCh := make(chan struct{})
 	go func() {
-		srv.Serve(ln)
+		srv.ServeFD(listenFD)
 	}()
 
 	if envURL != "" {
@@ -60,7 +58,7 @@ func main() {
 	case <-doneCh:
 	case <-sigCh:
 	}
-	_ = ln.Close()
+	_ = syscall.Close(listenFD)
 }
 
 func registerPort(envURL string, port int) error {
@@ -97,7 +95,7 @@ func pollDone(envURL string, doneCh chan<- struct{}) {
 	type doneResp struct {
 		Done bool `json:"done"`
 	}
-	backoff := 500 * time.Millisecond
+	backoff := 800 * time.Millisecond
 	for {
 		resp, err := client.Get(envURL + "/done")
 		if err == nil {
@@ -110,7 +108,7 @@ func pollDone(envURL string, doneCh chan<- struct{}) {
 					return
 				}
 			}
-			backoff = 500 * time.Millisecond
+			backoff = 800 * time.Millisecond
 		} else {
 			if backoff < time.Second {
 				backoff *= 2

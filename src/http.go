@@ -3,27 +3,116 @@ package main
 import (
 	"bytes"
 	"io"
-	"net"
+	"runtime"
 	"strconv"
-	"strings"
+	"sync"
+	"syscall"
+	"unsafe"
+)
+
+var (
+	hdrDelimCRLFCRLF  = []byte("\r\n\r\n")
+	hdrDelimCRLF      = []byte("\r\n")
+	prefixReposAPI    = []byte("/api/v3/repos/")
+	prefixAPIV3       = []byte("/api/v3")
+	prefixIssuesSlash = []byte("/issues/")
+	pathIssuesExact   = []byte("/issues")
+	pathHealthz       = []byte("/healthz")
+	pathGraphQL       = []byte("/api/graphql")
+	pathMCP           = []byte("/mcp")
+	dotGitSlash       = []byte(".git/")
+	gitInfoRefs       = []byte("info/refs")
+	gitUploadPack     = []byte("git-upload-pack")
+	gitReceivePack    = []byte("git-receive-pack")
+	hdrHost           = []byte("host")
+	hdrConnection     = []byte("connection")
+	hdrClose          = []byte("close")
+	hdrCloseTitle     = []byte("Close")
+	hdrGitProto       = []byte("git-protocol")
+	hdrAuthorization  = []byte("authorization")
+	hdrContentLength  = []byte("content-length")
+	hdrTransferEnc    = []byte("transfer-encoding")
+	valChunked        = []byte("chunked")
+	methodPOST        = []byte("POST")
 )
 
 type Server struct {
-	store *Store
+	store       *Store
+	readBufPool sync.Pool
+	scratchPool sync.Pool
 }
 
 func NewServer(store *Store) *Server {
-	return &Server{store: store}
+	srv := &Server{
+		store: store,
+		readBufPool: sync.Pool{
+			New: func() any {
+				b := make([]byte, 16384)
+				return &b
+			},
+		},
+		scratchPool: sync.Pool{
+			New: func() any {
+				b := make([]byte, 0, 8192)
+				return &b
+			},
+		},
+	}
+	// Pre-warm pooled buffers at startup to avoid gVisor page faults during concurrent clone bursts.
+	preRead := make([]*[]byte, 64)
+	preScratch := make([]*[]byte, 64)
+	for i := 0; i < 64; i++ {
+		rb := make([]byte, 16384)
+		sb := make([]byte, 0, 8192)
+		preRead[i] = &rb
+		preScratch[i] = &sb
+	}
+	for i := 0; i < 64; i++ {
+		srv.readBufPool.Put(preRead[i])
+		srv.scratchPool.Put(preScratch[i])
+	}
+	return srv
 }
 
-func (srv *Server) Serve(ln *net.TCPListener) {
+func listenRawTCP() (int, int, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return -1, 0, err
+	}
+	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	sa := &syscall.SockaddrInet4{Port: 0, Addr: [4]byte{0, 0, 0, 0}}
+	if err := syscall.Bind(fd, sa); err != nil {
+		_ = syscall.Close(fd)
+		return -1, 0, err
+	}
+	if err := syscall.Listen(fd, 1024); err != nil {
+		_ = syscall.Close(fd)
+		return -1, 0, err
+	}
+	lsa, err := syscall.Getsockname(fd)
+	if err != nil {
+		_ = syscall.Close(fd)
+		return -1, 0, err
+	}
+	inet4, ok := lsa.(*syscall.SockaddrInet4)
+	if !ok {
+		_ = syscall.Close(fd)
+		return -1, 0, syscall.EINVAL
+	}
+	return fd, inet4.Port, nil
+}
+
+func (srv *Server) ServeFD(listenFD int) {
 	for {
-		conn, err := ln.AcceptTCP()
+		fd, _, err := syscall.Accept(listenFD)
 		if err != nil {
+			if err == syscall.EINTR || err == syscall.EAGAIN {
+				continue
+			}
 			return
 		}
-		_ = conn.SetNoDelay(true)
-		go srv.serveConn(conn)
+		_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
+		go srv.serveFD(fd)
 	}
 }
 
@@ -49,6 +138,19 @@ func equalFoldASCII(a, b []byte) bool {
 	return true
 }
 
+func containsFoldASCII(haystack, needle []byte) bool {
+	n := len(needle)
+	if n == 0 || len(haystack) < n {
+		return false
+	}
+	for i := 0; i <= len(haystack)-n; i++ {
+		if equalFoldASCII(haystack[i:i+n], needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func parsePositiveIntBytes(b []byte) (int, bool) {
 	if len(b) == 0 || len(b) > 10 {
 		return 0, false
@@ -64,23 +166,126 @@ func parsePositiveIntBytes(b []byte) (int, bool) {
 	return n, n > 0
 }
 
-func writeAll(conn *net.TCPConn, data []byte) error {
+func parseNonNegIntBytes(b []byte) (int, bool) {
+	if len(b) == 0 || len(b) > 10 {
+		return 0, false
+	}
+	n := 0
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, true
+}
+
+func rawRead(fd int, p []byte) (int, error) {
+	for {
+		n, err := syscall.Read(fd, p)
+		if err == syscall.EINTR {
+			continue
+		}
+		return n, err
+	}
+}
+
+func rawWriteAll(fd int, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	// Fast path for normal responses (<= 32 KiB): bypass Go entersyscall/exitsyscall with RawSyscall(SYS_WRITE).
+	if len(data) <= 32768 {
+		for len(data) > 0 {
+			r1, _, errno := syscall.RawSyscall(
+				syscall.SYS_WRITE,
+				uintptr(fd),
+				uintptr(unsafe.Pointer(&data[0])),
+				uintptr(len(data)),
+			)
+			if errno != 0 {
+				if errno == syscall.EINTR {
+					continue
+				}
+				if errno == syscall.EAGAIN {
+					break
+				}
+				return errno
+			}
+			n := int(r1)
+			if n <= 0 {
+				return io.ErrShortWrite
+			}
+			data = data[n:]
+		}
+		if len(data) == 0 {
+			return nil
+		}
+	}
 	for len(data) > 0 {
-		n, err := conn.Write(data)
+		n, err := syscall.Write(fd, data)
 		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
 			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
 		}
 		data = data[n:]
 	}
 	return nil
 }
 
-// serveConn implements a zero-allocation raw HTTP/1.1 keep-alive loop directly on the TCP socket.
-func (srv *Server) serveConn(conn *net.TCPConn) {
-	defer func() { _ = conn.Close() }()
+// serveFD implements a zero-allocation raw blocking-syscall HTTP/1.1 keep-alive loop directly on fd.
+// Completely bypasses Go's netpoller (0 EAGAIN, 0 epoll_ctl, 0 epoll_pwait, 0 futex -> 2 syscalls/req).
+func (srv *Server) serveFD(fd int) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer func() { _ = syscall.Close(fd) }()
 
-	buf := make([]byte, 131072) // 128 KiB reusable read buffer
-	scratch := make([]byte, 0, 16384)
+	bufPtr := srv.readBufPool.Get().(*[]byte)
+	buf := *bufPtr
+	scratchPtr := srv.scratchPool.Get().(*[]byte)
+	scratch := (*scratchPtr)[:0]
+	defer func() {
+		if cap(buf) <= 65536 {
+			*bufPtr = buf[:cap(buf)]
+			srv.readBufPool.Put(bufPtr)
+		}
+		if cap(scratch) <= 32768 {
+			*scratchPtr = scratch[:0]
+			srv.scratchPool.Put(scratchPtr)
+		}
+	}()
+
+	// Connection-local repo cache (avoids even atomic map hash lookups on keep-alive connections!)
+	var lastOwnerBuf [64]byte
+	var lastRepoBuf [128]byte
+	lastOwnerLen := 0
+	lastRepoLen := 0
+	var lastRepo *Repo
+
+	lookupRepo := func(owner, repoName []byte) *Repo {
+		if lastRepo != nil && !lastRepo.deleted.Load() &&
+			len(owner) == lastOwnerLen && len(repoName) == lastRepoLen &&
+			bytes.Equal(owner, lastOwnerBuf[:lastOwnerLen]) &&
+			bytes.Equal(repoName, lastRepoBuf[:lastRepoLen]) {
+			return lastRepo
+		}
+		r := srv.store.GetRepoBytes(owner, repoName)
+		if r != nil && len(owner) <= len(lastOwnerBuf) && len(repoName) <= len(lastRepoBuf) {
+			copy(lastOwnerBuf[:], owner)
+			copy(lastRepoBuf[:], repoName)
+			lastOwnerLen = len(owner)
+			lastRepoLen = len(repoName)
+			lastRepo = r
+		}
+		return r
+	}
+
 	rPos := 0
 	wPos := 0
 
@@ -100,11 +305,11 @@ func (srv *Server) serveConn(conn *net.TCPConn) {
 				copy(nb, buf[:wPos])
 				buf = nb
 			}
-			n, err := conn.Read(buf[wPos:])
+			n, err := rawRead(fd, buf[wPos:])
 			if n > 0 {
 				wPos += n
 			}
-			if err != nil {
+			if n == 0 || err != nil {
 				return wPos-rPos >= need
 			}
 		}
@@ -116,7 +321,7 @@ func (srv *Server) serveConn(conn *net.TCPConn) {
 		hdrEnd := -1
 		for {
 			if wPos > rPos {
-				if idx := bytes.Index(buf[rPos:wPos], []byte("\r\n\r\n")); idx >= 0 {
+				if idx := bytes.Index(buf[rPos:wPos], hdrDelimCRLFCRLF); idx >= 0 {
 					hdrEnd = rPos + idx
 					break
 				}
@@ -131,16 +336,13 @@ func (srv *Server) serveConn(conn *net.TCPConn) {
 				copy(nb, buf[:wPos])
 				buf = nb
 			}
-			n, err := conn.Read(buf[wPos:])
+			n, err := rawRead(fd, buf[wPos:])
 			if n > 0 {
 				wPos += n
 			}
-			if err != nil {
-				if err == io.EOF && wPos == rPos {
-					return
-				}
+			if n == 0 || err != nil {
 				if wPos > rPos {
-					if idx := bytes.Index(buf[rPos:wPos], []byte("\r\n\r\n")); idx >= 0 {
+					if idx := bytes.Index(buf[rPos:wPos], hdrDelimCRLFCRLF); idx >= 0 {
 						hdrEnd = rPos + idx
 						break
 					}
@@ -176,6 +378,54 @@ func (srv *Server) serveConn(conn *net.TCPConn) {
 		}
 		target := restLine[:sp2]
 
+		// ULTRA-HOT SIMD FAST PATH: GET /api/v3/repos/{owner}/{repo}/issues/{num}
+		// Skips header line-by-line loop entirely using a single AVX2 bytes.Index auth verification.
+		if len(method) == 3 && method[0] == 'G' && method[1] == 'E' && method[2] == 'T' &&
+			len(target) > 22 && bytes.HasPrefix(target, prefixReposAPI) &&
+			bytes.IndexByte(target, '?') < 0 {
+			rest := target[14:]
+			if s1 := bytes.IndexByte(rest, '/'); s1 > 0 {
+				rest2 := rest[s1+1:]
+				if s2 := bytes.IndexByte(rest2, '/'); s2 > 0 {
+					tail := rest2[s2:]
+					if len(tail) > 8 && bytes.HasPrefix(tail, prefixIssuesSlash) && bytes.IndexByte(tail[8:], '/') < 0 {
+						if num, ok := parsePositiveIntBytes(tail[8:]); ok {
+							authOK := srv.store.Token == ""
+							if !authOK {
+								if idx := bytes.Index(hdrBlock, srv.store.AuthHeader); idx >= 15 {
+									endPos := idx + len(srv.store.AuthHeader)
+									if endPos == len(hdrBlock) || hdrBlock[endPos] == '\r' {
+										p := idx - 1
+										for p >= 0 && (hdrBlock[p] == ' ' || hdrBlock[p] == '\t') {
+											p--
+										}
+										if p >= 13 && hdrBlock[p] == ':' && equalFoldASCII(hdrBlock[p-13:p], hdrAuthorization) {
+											if p-13 == 0 || hdrBlock[p-14] == '\n' {
+												authOK = true
+											}
+										}
+									}
+								}
+							}
+							if authOK && bytes.Index(hdrBlock, hdrClose) < 0 && bytes.Index(hdrBlock, hdrCloseTitle) < 0 {
+								r := lookupRepo(rest[:s1], rest2[:s2])
+								resp := srv.FastGetIssueHTTP(r, num)
+								if err := rawWriteAll(fd, resp); err != nil {
+									return
+								}
+								rPos = bodyStart
+								if rPos == wPos {
+									rPos = 0
+									wPos = 0
+								}
+								continue
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// Parse only needed headers with zero allocation
 		var authHdr []byte
 		var hostHdr []byte
@@ -203,29 +453,29 @@ func (srv *Server) serveConn(conn *net.TCPConn) {
 			v := bytes.TrimSpace(line[colon+1:])
 			switch len(k) {
 			case 4:
-				if (k[0] == 'H' || k[0] == 'h') && equalFoldASCII(k, []byte("host")) {
+				if (k[0] == 'H' || k[0] == 'h') && equalFoldASCII(k, hdrHost) {
 					hostHdr = v
 				}
 			case 10:
-				if (k[0] == 'C' || k[0] == 'c') && equalFoldASCII(k, []byte("connection")) && equalFoldASCII(v, []byte("close")) {
+				if (k[0] == 'C' || k[0] == 'c') && equalFoldASCII(k, hdrConnection) && equalFoldASCII(v, hdrClose) {
 					closeConn = true
 				}
 			case 12:
-				if (k[0] == 'G' || k[0] == 'g') && equalFoldASCII(k, []byte("git-protocol")) {
+				if (k[0] == 'G' || k[0] == 'g') && equalFoldASCII(k, hdrGitProto) {
 					gitProto = v
 				}
 			case 13:
-				if (k[0] == 'A' || k[0] == 'a') && equalFoldASCII(k, []byte("authorization")) {
+				if (k[0] == 'A' || k[0] == 'a') && equalFoldASCII(k, hdrAuthorization) {
 					authHdr = v
 				}
 			case 14:
-				if (k[0] == 'C' || k[0] == 'c') && equalFoldASCII(k, []byte("content-length")) {
-					if cl, err := strconv.Atoi(string(v)); err == nil && cl > 0 {
+				if (k[0] == 'C' || k[0] == 'c') && equalFoldASCII(k, hdrContentLength) {
+					if cl, ok := parseNonNegIntBytes(v); ok {
 						contentLen = cl
 					}
 				}
 			case 17:
-				if (k[0] == 'T' || k[0] == 't') && equalFoldASCII(k, []byte("transfer-encoding")) && bytes.Contains(bytes.ToLower(v), []byte("chunked")) {
+				if (k[0] == 'T' || k[0] == 't') && equalFoldASCII(k, hdrTransferEnc) && containsFoldASCII(v, valChunked) {
 					chunked = true
 				}
 			}
@@ -236,15 +486,15 @@ func (srv *Server) serveConn(conn *net.TCPConn) {
 		// hot-path requests stay 100% zero-allocation!
 		var body []byte
 		rPos = bodyStart
-		cloneBytes := func(src []byte) []byte {
-			if len(src) == 0 {
-				return nil
-			}
-			cp := make([]byte, len(src))
-			copy(cp, src)
-			return cp
-		}
 		if chunked || (contentLen > 0 && wPos-rPos < contentLen) {
+			cloneBytes := func(src []byte) []byte {
+				if len(src) == 0 {
+					return nil
+				}
+				cp := make([]byte, len(src))
+				copy(cp, src)
+				return cp
+			}
 			method = cloneBytes(method)
 			target = cloneBytes(target)
 			authHdr = cloneBytes(authHdr)
@@ -259,7 +509,7 @@ func (srv *Server) serveConn(conn *net.TCPConn) {
 				lineEnd := -1
 				for {
 					if wPos > rPos {
-						if idx := bytes.Index(buf[rPos:wPos], []byte("\r\n")); idx >= 0 {
+						if idx := bytes.Index(buf[rPos:wPos], hdrDelimCRLF); idx >= 0 {
 							lineEnd = rPos + idx
 							break
 						}
@@ -299,8 +549,8 @@ func (srv *Server) serveConn(conn *net.TCPConn) {
 			rPos += contentLen
 		}
 
-		resp := srv.dispatchRequest(method, target, authHdr, hostHdr, gitProto, body, scratch)
-		if err := writeAll(conn, resp); err != nil {
+		resp := srv.dispatchRequest(method, target, authHdr, hostHdr, gitProto, body, scratch, lookupRepo)
+		if err := rawWriteAll(fd, resp); err != nil {
 			return
 		}
 		if closeConn {
@@ -313,7 +563,10 @@ func (srv *Server) serveConn(conn *net.TCPConn) {
 	}
 }
 
-func (srv *Server) dispatchRequest(method, target, authHdr, hostHdr, gitProto, body, scratch []byte) []byte {
+func (srv *Server) dispatchRequest(
+	method, target, authHdr, hostHdr, gitProto, body, scratch []byte,
+	lookupRepo func(owner, repoName []byte) *Repo,
+) []byte {
 	// Split path and query
 	path := target
 	var query []byte
@@ -323,7 +576,7 @@ func (srv *Server) dispatchRequest(method, target, authHdr, hostHdr, gitProto, b
 	}
 
 	// 1. /healthz (unauthenticated)
-	if len(path) == 8 && bytes.Equal(path, []byte("/healthz")) {
+	if len(path) == 8 && bytes.Equal(path, pathHealthz) {
 		return respHealthzHTTP
 	}
 
@@ -336,7 +589,7 @@ func (srv *Server) dispatchRequest(method, target, authHdr, hostHdr, gitProto, b
 
 	// 3. ULTRA-HOT FAST PATHS (ZERO ALLOCATION!)
 	// 3a. /api/v3/repos/{owner}/{repo}/issues[/{num}]
-	if len(path) > 14 && bytes.HasPrefix(path, []byte("/api/v3/repos/")) {
+	if len(path) > 14 && bytes.HasPrefix(path, prefixReposAPI) {
 		rest := path[14:]
 		s1 := bytes.IndexByte(rest, '/')
 		if s1 > 0 {
@@ -347,17 +600,17 @@ func (srv *Server) dispatchRequest(method, target, authHdr, hostHdr, gitProto, b
 				repoName := rest2[:s2]
 				tail := rest2[s2:]
 				// Fast GET /issues/{num}
-				if len(method) == 3 && method[0] == 'G' && len(tail) > 8 && bytes.HasPrefix(tail, []byte("/issues/")) {
+				if len(method) == 3 && method[0] == 'G' && len(tail) > 8 && bytes.HasPrefix(tail, prefixIssuesSlash) {
 					numBytes := tail[8:]
 					if bytes.IndexByte(numBytes, '/') < 0 {
 						if num, ok := parsePositiveIntBytes(numBytes); ok {
-							return srv.FastGetIssueHTTP(owner, repoName, num)
+							return srv.FastGetIssueHTTP(lookupRepo(owner, repoName), num)
 						}
 					}
 				}
 				// Fast POST /issues
-				if len(method) == 4 && method[0] == 'P' && method[1] == 'O' && bytes.Equal(tail, []byte("/issues")) {
-					return srv.FastCreateIssueHTTP(owner, repoName, body, scratch)
+				if len(method) == 4 && method[0] == 'P' && method[1] == 'O' && bytes.Equal(tail, pathIssuesExact) {
+					return srv.FastCreateIssueHTTP(lookupRepo(owner, repoName), body, scratch)
 				}
 			}
 		}
@@ -365,21 +618,21 @@ func (srv *Server) dispatchRequest(method, target, authHdr, hostHdr, gitProto, b
 	}
 
 	// 3b. /api/v3...
-	if bytes.HasPrefix(path, []byte("/api/v3")) {
+	if bytes.HasPrefix(path, prefixAPIV3) {
 		return srv.handleREST(string(method), string(path), string(query), string(hostHdr), body)
 	}
 
 	// 3c. /api/graphql
-	if bytes.Equal(path, []byte("/api/graphql")) {
-		if !bytes.Equal(method, []byte("POST")) {
+	if bytes.Equal(path, pathGraphQL) {
+		if !bytes.Equal(method, methodPOST) {
 			return respNotFoundJSON
 		}
 		return srv.handleGraphQL(body)
 	}
 
 	// 3d. /mcp
-	if bytes.Equal(path, []byte("/mcp")) {
-		if !bytes.Equal(method, []byte("POST")) {
+	if bytes.Equal(path, pathMCP) {
+		if !bytes.Equal(method, methodPOST) {
 			return respNotFoundJSON
 		}
 		return srv.handleMCP(body)
@@ -387,25 +640,24 @@ func (srv *Server) dispatchRequest(method, target, authHdr, hostHdr, gitProto, b
 
 	// 3e. Git Smart HTTP: /{owner}/{repo}.git/...
 	if len(path) > 1 && path[0] == '/' {
-		if gitIdx := bytes.Index(path, []byte(".git/")); gitIdx > 0 {
+		if gitIdx := bytes.Index(path, dotGitSlash); gitIdx > 0 {
 			prefix := path[1:gitIdx]
 			if slash := bytes.IndexByte(prefix, '/'); slash > 0 {
 				owner := prefix[:slash]
 				repoName := prefix[slash+1:]
 				gitSub := path[gitIdx+5:]
-				if len(method) == 3 && method[0] == 'G' && bytes.Equal(gitSub, []byte("info/refs")) {
-					return srv.handleGitInfoRefs(owner, repoName, query, gitProto)
+				if len(method) == 3 && method[0] == 'G' && bytes.Equal(gitSub, gitInfoRefs) {
+					return srv.handleGitInfoRefs(lookupRepo(owner, repoName), query, gitProto)
 				}
-				if len(method) == 4 && method[0] == 'P' && bytes.Equal(gitSub, []byte("git-upload-pack")) {
-					return srv.handleGitUploadPack(owner, repoName, gitProto, body)
+				if len(method) == 4 && method[0] == 'P' && bytes.Equal(gitSub, gitUploadPack) {
+					return srv.handleGitUploadPack(lookupRepo(owner, repoName), gitProto, body)
 				}
-				if len(method) == 4 && method[0] == 'P' && bytes.Equal(gitSub, []byte("git-receive-pack")) {
-					return srv.handleGitReceivePack(owner, repoName, body)
+				if len(method) == 4 && method[0] == 'P' && bytes.Equal(gitSub, gitReceivePack) {
+					return srv.handleGitReceivePack(lookupRepo(owner, repoName), body)
 				}
 			}
 		}
 	}
 
-	_ = strings.Builder{}
 	return respNotFoundJSON
 }

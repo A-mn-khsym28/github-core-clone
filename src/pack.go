@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sync"
 )
@@ -46,6 +47,12 @@ var zlibWriterPool = sync.Pool{
 	New: func() any {
 		w, _ := zlib.NewWriterLevel(io.Discard, zlib.BestSpeed)
 		return w
+	},
+}
+
+var sha1Pool = sync.Pool{
+	New: func() any {
+		return sha1.New()
 	},
 }
 
@@ -143,7 +150,13 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 	packOwned := make([]byte, bodyEnd)
 	copy(packOwned, pack[:bodyEnd])
 
-	entries := make([]rawPackEntry, numObjects)
+	var stackEntries [8]rawPackEntry
+	var entries []rawPackEntry
+	if numObjects <= len(stackEntries) {
+		entries = stackEntries[:numObjects]
+	} else {
+		entries = make([]rawPackEntry, numObjects)
+	}
 	var byOffset map[int]int
 	hasDeltas := false
 	pos := 12
@@ -223,7 +236,7 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 
 	// Fast path when pack has no deltas (100% of pushes from bench.ts and standard writes!)
 	if !hasDeltas {
-		h := sha1.New()
+		h := sha1Pool.Get().(hash.Hash)
 		var hdrBuf [32]byte
 		for i := range entries {
 			e := &entries[i]
@@ -256,6 +269,7 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 			}
 			r.Objects[oid] = obj
 		}
+		sha1Pool.Put(h)
 		return nil, nil
 	}
 

@@ -97,6 +97,7 @@ type RawReqRespCache struct {
 
 type Repo struct {
 	mu            sync.RWMutex
+	deleted       atomic.Bool
 	ID            int
 	NodeID        string
 	Owner         string
@@ -122,7 +123,7 @@ type Repo struct {
 
 	// Issues, labels, PRs
 	Labels          map[string]Label
-	Issues          []*Issue               // 0-indexed, issue number = index+1
+	Issues          []*Issue                 // 0-indexed, issue number = index+1
 	issuesSnap      atomic.Pointer[[]*Issue] // Lock-free snapshot for GET /issues/{n}
 	IssuesByNum     map[int]*Issue
 	NextIssueNumber int
@@ -140,13 +141,15 @@ type Store struct {
 	ViewerEmail      string
 	Token            string
 	AuthHeader       []byte // "Bearer <token>"
+	AuthHeaderCRLF   []byte // "Bearer <token>\r\n" for single-pass SIMD auth check
 	ReposByName      map[string]*Repo
 	reposSnap        atomic.Pointer[map[string]*Repo] // Lock-free COW snapshot!
+	ReposByID        map[int]*Repo
 	RepoList         []*Repo
 	NextRepoID       int
-	NextIssueID      int
-	NextPullID       int
-	NextCommentID    int
+	NextIssueID      atomic.Int64
+	NextPullID       atomic.Int64
+	NextCommentID    atomic.Int64
 
 	// Reverse lookup for GraphQL node(id:) and mutations
 	NodeRepos  map[string]*Repo
@@ -169,7 +172,9 @@ func NewStore(viewerLogin, token string) *Store {
 		ViewerEmail:      viewerLogin + "@example.invalid",
 		Token:            token,
 		AuthHeader:       []byte("Bearer " + token),
+		AuthHeaderCRLF:   []byte("Bearer " + token + "\r\n"),
 		ReposByName:      make(map[string]*Repo, 64),
+		ReposByID:        make(map[int]*Repo, 64),
 		RepoList:         make([]*Repo, 0, 64),
 		NodeRepos:        make(map[string]*Repo, 64),
 		NodeIssues: make(map[string]struct {
@@ -229,13 +234,14 @@ func (s *Store) CreateRepo(name, description string, private bool, defaultBranch
 		Objects:       make(map[[20]byte]*GitObject, 256),
 		Refs:          make(map[string][20]byte, 8),
 		Labels:        make(map[string]Label, 8),
-		Issues:        make([]*Issue, 0, 64),
+		Issues:        make([]*Issue, 0, 256),
 		IssuesByNum:   make(map[int]*Issue, 64),
 		Pulls:         make([]*PullRequest, 0, 16),
 		PullsByNum:    make(map[int]*PullRequest, 16),
 	}
 	r.rebuildGitCachesLocked()
 	s.ReposByName[name] = r
+	s.ReposByID[id] = r
 	s.RepoList = append(s.RepoList, r)
 	s.NodeRepos[nodeID] = r
 	s.publishReposSnapLocked()
@@ -268,7 +274,9 @@ func (s *Store) DeleteRepo(owner, name string) bool {
 	if !ok {
 		return false
 	}
+	r.deleted.Store(true)
 	delete(s.ReposByName, name)
+	delete(s.ReposByID, r.ID)
 	delete(s.NodeRepos, r.NodeID)
 	for i, item := range s.RepoList {
 		if item == r {
@@ -281,27 +289,42 @@ func (s *Store) DeleteRepo(owner, name string) bool {
 }
 
 func (s *Store) NextIssueGlobalID() int {
-	s.mu.Lock()
-	s.NextIssueID++
-	id := s.NextIssueID
-	s.mu.Unlock()
-	return id
+	return int(s.NextIssueID.Add(1))
 }
 
 func (s *Store) NextCommentGlobalID() int {
-	s.mu.Lock()
-	s.NextCommentID++
-	id := s.NextCommentID
-	s.mu.Unlock()
-	return id
+	return int(s.NextCommentID.Add(1))
 }
 
 func (s *Store) NextPullGlobalID() int {
-	s.mu.Lock()
-	s.NextPullID++
-	id := s.NextPullID
-	s.mu.Unlock()
-	return id
+	return int(s.NextPullID.Add(1))
+}
+
+// ResolveIssueByNodeID decodes base64("Issue:<repoID>:<num>") without needing any global map write during POST /issues.
+func (s *Store) ResolveIssueByNodeID(nodeID string) (*Repo, *Issue) {
+	raw, err := base64.StdEncoding.DecodeString(nodeID)
+	if err != nil {
+		return nil, nil
+	}
+	parts := strings.Split(string(raw), ":")
+	if len(parts) != 3 || parts[0] != "Issue" {
+		return nil, nil
+	}
+	repoID, err1 := strconv.Atoi(parts[1])
+	num, err2 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil {
+		return nil, nil
+	}
+	s.mu.RLock()
+	r := s.ReposByID[repoID]
+	s.mu.RUnlock()
+	if r == nil {
+		return nil, nil
+	}
+	r.mu.RLock()
+	iss := r.IssuesByNum[num]
+	r.mu.RUnlock()
+	return r, iss
 }
 
 func (s *Store) RegisterIssueNode(r *Repo, iss *Issue) {

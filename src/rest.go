@@ -201,8 +201,7 @@ func fastParseTitleBody(b []byte) (string, string, bool) {
 }
 
 // FastGetIssueHTTP serves GET /api/v3/repos/{o}/{r}/issues/{n} with ZERO allocations and ZERO mutexes!
-func (srv *Server) FastGetIssueHTTP(owner, repoName []byte, num int) []byte {
-	r := srv.store.GetRepoBytes(owner, repoName)
+func (srv *Server) FastGetIssueHTTP(r *Repo, num int) []byte {
 	if r == nil || num <= 0 {
 		return respNotFoundJSON
 	}
@@ -212,6 +211,11 @@ func (srv *Server) FastGetIssueHTTP(owner, repoName []byte, num int) []byte {
 			if p := iss.cachedGetHTTP.Load(); p != nil {
 				return *p
 			}
+			r.mu.Lock()
+			iss.refreshCachedHTTP()
+			p := iss.cachedGetHTTP.Load()
+			r.mu.Unlock()
+			return *p
 		}
 	}
 	r.mu.RLock()
@@ -230,9 +234,8 @@ func (srv *Server) FastGetIssueHTTP(owner, repoName []byte, num int) []byte {
 	return *p
 }
 
-// FastCreateIssueHTTP serves POST /api/v3/repos/{o}/{r}/issues directly into scratchBuf!
-func (srv *Server) FastCreateIssueHTTP(owner, repoName, body []byte, scratch []byte) []byte {
-	r := srv.store.GetRepoBytes(owner, repoName)
+// FastCreateIssueHTTP serves POST /api/v3/repos/{o}/{r}/issues directly into scratchBuf with ZERO global locks!
+func (srv *Server) FastCreateIssueHTTP(r *Repo, body []byte, scratch []byte) []byte {
 	if r == nil {
 		return respNotFoundJSON
 	}
@@ -243,7 +246,6 @@ func (srv *Server) FastCreateIssueHTTP(owner, repoName, body []byte, scratch []b
 		num := r.NextIssueNumber
 		iss := &Issue{
 			ID:         globalID,
-			NodeID:     encodeNodeID("Issue", r.ID, num),
 			Number:     num,
 			Title:      title,
 			Body:       ibody,
@@ -252,14 +254,15 @@ func (srv *Server) FastCreateIssueHTTP(owner, repoName, body []byte, scratch []b
 			CreatedAt:  "2025-01-01T00:00:00Z",
 			UpdatedAt:  "2025-01-01T00:00:00Z",
 		}
-		jsonBody := iss.refreshCachedHTTP()
 		r.Issues = append(r.Issues, iss)
 		snap := r.Issues
 		r.issuesSnap.Store(&snap)
 		r.IssuesByNum[num] = iss
 		r.mu.Unlock()
-		srv.store.RegisterIssueNode(r, iss)
 
+		// Build compact JSON body directly in tail of scratch without extra heap alloc!
+		var jBuf [1024]byte
+		jsonBody := buildIssueJSON(jBuf[:0], iss)
 		resp := scratch[:0]
 		resp = append(resp, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: "...)
 		resp = strconv.AppendInt(resp, int64(len(jsonBody)), 10)

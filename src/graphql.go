@@ -703,15 +703,14 @@ func (e *gqlExec) resolveIntrospectionType(tName string, sels []gqlSelection) an
 func (e *gqlExec) resolveNode(id string, sels []gqlSelection) any {
 	e.srv.store.mu.RLock()
 	r := e.srv.store.NodeRepos[id]
-	issRef, hasIss := e.srv.store.NodeIssues[id]
 	prRef, hasPR := e.srv.store.NodePulls[id]
 	e.srv.store.mu.RUnlock()
 
 	if r != nil {
 		return e.resolveRepo(r, sels)
 	}
-	if hasIss {
-		return e.resolveIssue(issRef.Issue, sels)
+	if ir, iss := e.srv.store.ResolveIssueByNodeID(id); ir != nil && iss != nil {
+		return e.resolveIssue(ir, iss, sels)
 	}
 	if hasPR {
 		return e.resolvePull(prRef.Repo, prRef.Pull, sels)
@@ -774,7 +773,7 @@ func (e *gqlExec) resolveRepo(r *Repo, sels []gqlSelection) map[string]any {
 			if iss == nil {
 				out[f.alias] = nil
 			} else {
-				out[f.alias] = e.resolveIssue(iss, f.selections)
+				out[f.alias] = e.resolveIssue(r, iss, f.selections)
 			}
 		case "issues":
 			out[f.alias] = e.resolveIssuesConnection(r, f.args, f.selections)
@@ -797,13 +796,16 @@ func (e *gqlExec) resolveRepo(r *Repo, sels []gqlSelection) map[string]any {
 	return out
 }
 
-func (e *gqlExec) resolveIssue(iss *Issue, sels []gqlSelection) map[string]any {
+func (e *gqlExec) resolveIssue(r *Repo, iss *Issue, sels []gqlSelection) map[string]any {
 	out := make(map[string]any)
 	for _, f := range e.flatten(sels, "Issue") {
 		switch f.name {
 		case "__typename":
 			out[f.alias] = "Issue"
 		case "id":
+			if iss.NodeID == "" {
+				iss.NodeID = encodeNodeID("Issue", r.ID, iss.Number)
+			}
 			out[f.alias] = iss.NodeID
 		case "databaseId":
 			out[f.alias] = iss.ID
@@ -891,7 +893,7 @@ func (e *gqlExec) resolveIssuesConnection(r *Repo, args map[string]any, sels []g
 		case "nodes":
 			nodes := make([]map[string]any, 0, len(page))
 			for _, iss := range page {
-				nodes = append(nodes, e.resolveIssue(iss, f.selections))
+				nodes = append(nodes, e.resolveIssue(r, iss, f.selections))
 			}
 			out[f.alias] = nodes
 		case "totalCount":
@@ -1065,28 +1067,26 @@ func (e *gqlExec) execMutation(sels []gqlSelection) map[string]any {
 			payload := make(map[string]any)
 			for _, pf := range e.flatten(f.selections, "CreateIssuePayload") {
 				if pf.name == "issue" {
-					payload[pf.alias] = e.resolveIssue(iss, pf.selections)
+					payload[pf.alias] = e.resolveIssue(r, iss, pf.selections)
 				}
 			}
 			out[f.alias] = payload
 
 		case "closeIssue":
 			issueID := argString(input, "issueId")
-			e.srv.store.mu.RLock()
-			ref, ok := e.srv.store.NodeIssues[issueID]
-			e.srv.store.mu.RUnlock()
-			if !ok {
+			r, iss := e.srv.store.ResolveIssueByNodeID(issueID)
+			if r == nil || iss == nil {
 				e.addErr("Issue not found")
 				continue
 			}
-			ref.Repo.mu.Lock()
-			ref.Issue.State = "closed"
-			ref.Issue.refreshCachedHTTP()
-			ref.Repo.mu.Unlock()
+			r.mu.Lock()
+			iss.State = "closed"
+			iss.refreshCachedHTTP()
+			r.mu.Unlock()
 			payload := make(map[string]any)
 			for _, pf := range e.flatten(f.selections, "CloseIssuePayload") {
 				if pf.name == "issue" {
-					payload[pf.alias] = e.resolveIssue(ref.Issue, pf.selections)
+					payload[pf.alias] = e.resolveIssue(r, iss, pf.selections)
 				}
 			}
 			out[f.alias] = payload
@@ -1142,15 +1142,13 @@ func (e *gqlExec) execMutation(sels []gqlSelection) map[string]any {
 		case "addComment":
 			subjectID := argString(input, "subjectId")
 			cBody := argString(input, "body")
-			e.srv.store.mu.RLock()
-			ref, ok := e.srv.store.NodeIssues[subjectID]
-			e.srv.store.mu.RUnlock()
-			if !ok {
+			r, iss := e.srv.store.ResolveIssueByNodeID(subjectID)
+			if r == nil || iss == nil {
 				e.addErr("Subject not found")
 				continue
 			}
 			cid := e.srv.store.NextCommentGlobalID()
-			ref.Repo.mu.Lock()
+			r.mu.Lock()
 			c := &Comment{
 				ID:        cid,
 				NodeID:    encodeNodeID("IssueComment", cid),
@@ -1158,9 +1156,9 @@ func (e *gqlExec) execMutation(sels []gqlSelection) map[string]any {
 				Author:    e.srv.store.ViewerLogin,
 				CreatedAt: "2025-01-01T00:00:00Z",
 			}
-			ref.Issue.Comments = append(ref.Issue.Comments, c)
-			ref.Issue.refreshCachedHTTP()
-			ref.Repo.mu.Unlock()
+			iss.Comments = append(iss.Comments, c)
+			iss.refreshCachedHTTP()
+			r.mu.Unlock()
 			payload := make(map[string]any)
 			for _, pf := range e.flatten(f.selections, "AddCommentPayload") {
 				if pf.name == "commentEdge" {
