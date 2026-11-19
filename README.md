@@ -2,9 +2,9 @@
 
 [![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 [![rank](https://make.fun/badge/github-core-clone-01/A-mn-khsym28/github-core-clone/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
-[![reward](https://make.fun/badge/github-core-clone-01/A-mn-khsym28/github-core-clone/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/A-mn-khsym28/github-core-clone/reward.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
 
-High-performance, zero-dependency, in-memory GitHub-compatible git forge implementing Git Smart HTTP (upload-pack v2/v0, receive-pack v0), REST API v3, GraphQL API v4, and Model Context Protocol (MCP) over Streamable HTTP on Node 22.
+Standalone GitHub-compatible git forge with a static Go core, raw TCP HTTP/1.1 zero-alloc hot paths, pooled flate pack parsing, zero-deflate pack building, atomic lock-free clone/read caches, REST v3, GraphQL v4, and MCP Streamable HTTP.
 
 ## Run it
 
