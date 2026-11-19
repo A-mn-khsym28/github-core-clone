@@ -74,11 +74,12 @@ func (c *connState) lookupRepo(srv *Server, owner, repoName []byte) *Repo {
 }
 
 type Server struct {
-	store     *Store
-	scratch   []byte
-	connsArr  [512]*connState
-	connsMap  map[int]*connState
-	freeConns []*connState
+	store       *Store
+	scratch     []byte
+	connsArr    [512]*connState
+	connsMap    map[int]*connState
+	freeConns   []*connState
+	activeConns int
 }
 
 func NewServer(store *Store) *Server {
@@ -123,6 +124,7 @@ func (srv *Server) allocConn(fd int) *connState {
 	} else {
 		srv.connsMap[fd] = c
 	}
+	srv.activeConns++
 	return c
 }
 
@@ -144,6 +146,7 @@ func (srv *Server) closeConn(c *connState) {
 		delete(srv.connsMap, fd)
 	}
 	c.fd = -1
+	srv.activeConns--
 	_, _, _ = syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(fd), 0, 0)
 	c.pendingWrite = nil
 	c.lastRepo = nil
@@ -235,7 +238,7 @@ func rawNonBlockWrite(fd int, p []byte) (int, syscall.Errno) {
 
 // ServeFD runs a single-threaded raw Linux epoll event loop pinned to one OS thread.
 // Zero Go netpoller, zero goroutine-per-conn, zero thread spawns on clone bursts,
-// zero EAGAIN reads on steady-state keep-alive requests (3 raw syscalls/req total).
+// zero socket lock contention (3 raw syscalls/req total).
 func (srv *Server) ServeFD(listenFD int) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -253,6 +256,7 @@ func (srv *Server) ServeFD(listenFD int) {
 	var events [64]syscall.EpollEvent
 	one := int32(1)
 	negOne := ^uintptr(0)
+	var hotConn *connState
 
 	for {
 		r1, _, errno := syscall.RawSyscall6(
@@ -271,61 +275,79 @@ func (srv *Server) ServeFD(listenFD int) {
 			return
 		}
 		n := int(r1)
-		for i := 0; i < n; i++ {
-			fd := int(events[i].Fd)
-			ev := events[i].Events
-			if fd == listenFD {
-				for {
-					cr1, _, cerr := syscall.RawSyscall6(
-						syscall.SYS_ACCEPT4,
-						uintptr(listenFD),
-						0,
-						0,
-						uintptr(syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC),
-						0,
-						0,
-					)
-					if cerr != 0 {
-						if cerr == syscall.EINTR {
-							continue
-						}
-						break
-					}
-					cfd := int(cr1)
-					_, _, _ = syscall.RawSyscall6(
-						syscall.SYS_SETSOCKOPT,
-						uintptr(cfd),
-						uintptr(syscall.IPPROTO_TCP),
-						uintptr(syscall.TCP_NODELAY),
-						uintptr(unsafe.Pointer(&one)),
-						4,
-						0,
-					)
-					if rawEpollCtl(epfd, syscall.EPOLL_CTL_ADD, cfd, syscall.EPOLLIN) != 0 {
-						_, _, _ = syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(cfd), 0, 0)
+		if n > 0 {
+			srv.dispatchEvents(epfd, listenFD, events[:n], &hotConn, &one)
+		}
+	}
+}
+
+func (srv *Server) dispatchEvents(epfd, listenFD int, evs []syscall.EpollEvent, hotConn **connState, one *int32) {
+	for i := 0; i < len(evs); i++ {
+		fd := int(evs[i].Fd)
+		ev := evs[i].Events
+		if fd == listenFD {
+			for {
+				cr1, _, cerr := syscall.RawSyscall6(
+					syscall.SYS_ACCEPT4,
+					uintptr(listenFD),
+					0,
+					0,
+					uintptr(syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC),
+					0,
+					0,
+				)
+				if cerr != 0 {
+					if cerr == syscall.EINTR {
 						continue
 					}
-					srv.allocConn(cfd)
+					break
 				}
-				continue
-			}
-
-			c := srv.getConn(fd)
-			if c == nil {
-				continue
-			}
-			if (ev&(syscall.EPOLLERR|syscall.EPOLLHUP)) != 0 && (ev&syscall.EPOLLIN) == 0 {
-				srv.closeConn(c)
-				continue
-			}
-			if (ev & syscall.EPOLLOUT) != 0 {
-				srv.flushPending(epfd, c)
-				if c.fd < 0 {
+				cfd := int(cr1)
+				_, _, _ = syscall.RawSyscall6(
+					syscall.SYS_SETSOCKOPT,
+					uintptr(cfd),
+					uintptr(syscall.IPPROTO_TCP),
+					uintptr(syscall.TCP_NODELAY),
+					uintptr(unsafe.Pointer(one)),
+					4,
+					0,
+				)
+				if rawEpollCtl(epfd, syscall.EPOLL_CTL_ADD, cfd, syscall.EPOLLIN) != 0 {
+					_, _, _ = syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(cfd), 0, 0)
 					continue
 				}
+				c := srv.allocConn(cfd)
+				*hotConn = c
 			}
-			if (ev & syscall.EPOLLIN) != 0 {
-				srv.onReadable(epfd, c)
+			continue
+		}
+
+		c := srv.getConn(fd)
+		if c == nil {
+			continue
+		}
+		if (ev&(syscall.EPOLLERR|syscall.EPOLLHUP)) != 0 && (ev&syscall.EPOLLIN) == 0 {
+			if *hotConn == c {
+				*hotConn = nil
+			}
+			srv.closeConn(c)
+			continue
+		}
+		if (ev & syscall.EPOLLOUT) != 0 {
+			srv.flushPending(epfd, c)
+			if c.fd < 0 {
+				if *hotConn == c {
+					*hotConn = nil
+				}
+				continue
+			}
+		}
+		if (ev & syscall.EPOLLIN) != 0 {
+			srv.onReadable(epfd, c)
+			if c.fd >= 0 {
+				*hotConn = c
+			} else if *hotConn == c {
+				*hotConn = nil
 			}
 		}
 	}

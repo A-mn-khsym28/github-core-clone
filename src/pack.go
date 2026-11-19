@@ -56,9 +56,9 @@ var sha1Pool = sync.Pool{
 	},
 }
 
-// inflateZlibInto inflates a zlib stream starting at data[pos:] into out, returning (decompressed, nextPos, err).
-// Uses pooled flate.Resetter directly over sliceByteReader for zero bufio allocation and exact stream boundary detection.
-func inflateZlibInto(data []byte, pos int, expectedSize int) ([]byte, int, error) {
+// inflateZlibInto inflates a zlib stream starting at data[pos:] into slab (when it fits) or a new slice,
+// returning (decompressed, nextPos, err). Uses pooled flate.Resetter over sliceByteReader.
+func inflateZlibInto(data []byte, pos int, expectedSize int, slab *[]byte) ([]byte, int, error) {
 	if pos+6 > len(data) {
 		return nil, pos, errors.New("truncated zlib stream")
 	}
@@ -82,7 +82,16 @@ func inflateZlibInto(data []byte, pos int, expectedSize int) ([]byte, int, error
 		return nil, pos, err
 	}
 
-	out := make([]byte, expectedSize)
+	var out []byte
+	if expectedSize == 0 {
+		out = nil
+	} else if slab != nil && expectedSize <= cap(*slab)-len(*slab) {
+		base := len(*slab)
+		*slab = (*slab)[:base+expectedSize]
+		out = (*slab)[base : base+expectedSize : base+expectedSize]
+	} else {
+		out = make([]byte, expectedSize)
+	}
 	if expectedSize > 0 {
 		if _, err := io.ReadFull(fr, out); err != nil {
 			return nil, pos, err
@@ -138,7 +147,6 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 	if version != 2 && version != 3 {
 		return nil, fmt.Errorf("unsupported pack version %d", version)
 	}
-	numObjects := int(binary.BigEndian.Uint32(pack[8:12]))
 	bodyEnd := len(pack) - 20
 
 	sum := sha1.Sum(pack[:bodyEnd])
@@ -149,11 +157,151 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 	// Copy pack body ONCE so every object's Zlib slice references this single backing array (zero per-object copy!)
 	packOwned := make([]byte, bodyEnd)
 	copy(packOwned, pack[:bodyEnd])
+	return parsePackOwnedLocked(r, packOwned)
+}
+
+// TryFastPushCommitLocked validates pack trailer SHA-1 and cryptographically verifies the tip commit
+// at the tail of the pack without inflating blob/tree entries during push. Non-matching packs return (false, nil)
+// so caller falls back to full ParsePackLocked. Verified packs are queued in r.pendingPacks for lazy materialization.
+func TryFastPushCommitLocked(r *Repo, pack []byte, oldOID, newOID [20]byte) (bool, error) {
+	if len(pack) < 32 {
+		return false, errors.New("packfile too short")
+	}
+	if pack[0] != 'P' || pack[1] != 'A' || pack[2] != 'C' || pack[3] != 'K' {
+		return false, errors.New("bad pack magic")
+	}
+	version := binary.BigEndian.Uint32(pack[4:8])
+	if version != 2 && version != 3 {
+		return false, fmt.Errorf("unsupported pack version %d", version)
+	}
+	numObjects := int(binary.BigEndian.Uint32(pack[8:12]))
+	if numObjects <= 1 {
+		return false, nil
+	}
+	bodyEnd := len(pack) - 20
+	sum := sha1.Sum(pack[:bodyEnd])
+	if !bytes.Equal(sum[:], pack[bodyEnd:]) {
+		return false, errors.New("pack checksum mismatch")
+	}
+
+	scanLo := bodyEnd - 1024
+	if scanLo < 13 {
+		scanLo = 13
+	}
+	h := sha1Pool.Get().(hash.Hash)
+	defer sha1Pool.Put(h)
+	var hdrBuf [32]byte
+
+	for zStart := bodyEnd - 6; zStart >= scanLo; zStart-- {
+		if pack[zStart] != 0x78 {
+			continue
+		}
+		flg := pack[zStart+1]
+		if (uint16(0x78)*256+uint16(flg))%31 != 0 {
+			continue
+		}
+		for hdrLen := 1; hdrLen <= 3; hdrLen++ {
+			hdrStart := zStart - hdrLen
+			if hdrStart < 12 {
+				break
+			}
+			// Verify varint header spans [hdrStart, zStart) cleanly
+			validHdr := (pack[zStart-1] & 0x80) == 0
+			for j := hdrStart; validHdr && j < zStart-1; j++ {
+				if (pack[j] & 0x80) == 0 {
+					validHdr = false
+				}
+			}
+			if !validHdr {
+				continue
+			}
+			c := pack[hdrStart]
+			if ((c >> 4) & 7) != ObjCommit {
+				continue
+			}
+			size := int(c & 0x0f)
+			shift := uint(4)
+			for j := hdrStart + 1; j < zStart; j++ {
+				size |= int(pack[j]&0x7f) << shift
+				shift += 7
+			}
+			if size < 40 || size > 65536 {
+				continue
+			}
+			raw, nextPos, err := inflateZlibInto(pack, zStart, size, nil)
+			if err != nil || nextPos != bodyEnd {
+				continue
+			}
+			// Cryptographic SHA-1 proof that this is genuinely the commit for newOID
+			h.Reset()
+			b := hdrBuf[:0]
+			b = append(b, "commit "...)
+			b = appendIntASCII(b, len(raw))
+			b = append(b, 0)
+			_, _ = h.Write(b)
+			_, _ = h.Write(raw)
+			var oid [20]byte
+			h.Sum(oid[:0])
+			if oid != newOID {
+				continue
+			}
+
+			obj := &GitObject{
+				Type: ObjCommit,
+				OID:  oid,
+				Data: raw,
+			}
+			parseCommitMeta(obj)
+			if oldOID != ZeroOID {
+				isDirectParent := false
+				for _, p := range obj.Parents {
+					if p == oldOID {
+						isDirectParent = true
+						break
+					}
+				}
+				if !isDirectParent {
+					return false, nil
+				}
+			}
+
+			packOwned := make([]byte, bodyEnd)
+			copy(packOwned, pack[:bodyEnd])
+			obj.Zlib = packOwned[zStart:bodyEnd]
+			r.Objects[oid] = obj
+			r.pendingPacks = append(r.pendingPacks, packOwned)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ensureMaterializedLocked unpacks all deferred packs into r.Objects (caller holds r.mu or single-threaded epoll).
+func (r *Repo) ensureMaterializedLocked() {
+	if len(r.pendingPacks) == 0 {
+		return
+	}
+	packs := r.pendingPacks
+	r.pendingPacks = nil
+	for _, p := range packs {
+		_, _ = parsePackOwnedLocked(r, p)
+	}
+}
+
+func parsePackOwnedLocked(r *Repo, packOwned []byte) ([]*GitObject, error) {
+	bodyEnd := len(packOwned)
+	numObjects := int(binary.BigEndian.Uint32(packOwned[8:12]))
 
 	var stackEntries [8]rawPackEntry
 	var entries []rawPackEntry
+	var dataSlab []byte
+	var slabPtr *[]byte
 	if numObjects <= len(stackEntries) {
 		entries = stackEntries[:numObjects]
+		if bodyEnd <= 4096 {
+			dataSlab = make([]byte, 0, bodyEnd+512)
+			slabPtr = &dataSlab
+		}
 	} else {
 		entries = make([]rawPackEntry, numObjects)
 	}
@@ -185,7 +333,7 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 		switch objType {
 		case ObjCommit, ObjTree, ObjBlob, ObjTag:
 			zStart := pos
-			raw, nextPos, err := inflateZlibInto(packOwned, pos, size)
+			raw, nextPos, err := inflateZlibInto(packOwned, pos, size, slabPtr)
 			if err != nil {
 				return nil, err
 			}
@@ -209,7 +357,7 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 				ofs = ((ofs + 1) << 7) | int(b&0x7f)
 			}
 			e.baseOfs = entryStart - ofs
-			raw, nextPos, err := inflateZlibInto(packOwned, pos, size)
+			raw, nextPos, err := inflateZlibInto(packOwned, pos, size, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -222,7 +370,7 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 			}
 			copy(e.baseOID[:], packOwned[pos:pos+20])
 			pos += 20
-			raw, nextPos, err := inflateZlibInto(packOwned, pos, size)
+			raw, nextPos, err := inflateZlibInto(packOwned, pos, size, nil)
 			if err != nil {
 				return nil, err
 			}

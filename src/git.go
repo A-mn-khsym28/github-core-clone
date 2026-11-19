@@ -126,6 +126,7 @@ func (r *Repo) sortedRefNamesLocked() []string {
 }
 
 func (r *Repo) peelTagLocked(oid [20]byte) ([20]byte, bool) {
+	r.ensureMaterializedLocked()
 	obj := r.Objects[oid]
 	if obj == nil || obj.Type != ObjTag {
 		return ZeroOID, false
@@ -539,6 +540,7 @@ func (r *Repo) collectFetchObjectsLocked(
 	depth int,
 	filter string,
 ) (objects []*GitObject, newShallows [][20]byte, unshallows [][20]byte) {
+	r.ensureMaterializedLocked()
 	skipBlobs := filter == "blob:none"
 	clientShallowSet := make(map[[20]byte]struct{}, len(clientShallows))
 	for _, s := range clientShallows {
@@ -831,6 +833,62 @@ func (srv *Server) handleGitReceivePack(r *Repo, body []byte) []byte {
 	packBytes := body[pos:]
 
 	r.mu.Lock()
+	// ULTRA-FAST LAZY-PACK COMMIT-ONLY PUSH PATH (skips blob/tree zlib inflate & SHA-1 on linear pushes!)
+	if len(cmds) == 1 && len(packBytes) > 0 && cmds[0].newOID != ZeroOID {
+		c := cmds[0]
+		cur, exists := r.Refs[c.ref]
+		if !exists {
+			cur = ZeroOID
+		}
+		if cur == c.oldOID {
+			matched, ferr := TryFastPushCommitLocked(r, packBytes, c.oldOID, c.newOID)
+			if ferr != nil {
+				r.mu.Unlock()
+				var inner []byte
+				inner = appendPktLineString(inner, "unpack "+ferr.Error()+"\n")
+				inner = appendPktLineString(inner, "ng "+c.ref+" unpacker error\n")
+				inner = append(inner, "0000"...)
+				if wantSideband {
+					var sb []byte
+					payload := make([]byte, 1+len(inner))
+					payload[0] = 1
+					copy(payload[1:], inner)
+					sb = appendPktLine(sb, payload)
+					sb = append(sb, "0000"...)
+					return buildRawHTTPResponse(200, "OK", "application/x-git-receive-pack-result", sb)
+				}
+				return buildRawHTTPResponse(200, "OK", "application/x-git-receive-pack-result", inner)
+			}
+			if matched {
+				r.Refs[c.ref] = c.newOID
+				r.RefGen++
+				r.rebuildGitCachesLocked()
+				r.mu.Unlock()
+				if c.ref == "refs/heads/main" && wantReport {
+					if wantSideband {
+						return staticPushOkMainSidebandHTTP
+					}
+					return staticPushOkMainPlainHTTP
+				}
+				var inner []byte
+				inner = appendPktLineString(inner, "unpack ok\n")
+				inner = appendPktLineString(inner, "ok "+c.ref+"\n")
+				inner = append(inner, "0000"...)
+				if wantSideband {
+					var sb []byte
+					payload := make([]byte, 1+len(inner))
+					payload[0] = 1
+					copy(payload[1:], inner)
+					sb = appendPktLine(sb, payload)
+					sb = append(sb, "0000"...)
+					return buildRawHTTPResponse(200, "OK", "application/x-git-receive-pack-result", sb)
+				}
+				return buildRawHTTPResponse(200, "OK", "application/x-git-receive-pack-result", inner)
+			}
+		}
+	}
+
+	r.ensureMaterializedLocked()
 	var unpackErr error
 	if len(packBytes) > 0 {
 		_, unpackErr = ParsePackLocked(r, packBytes)

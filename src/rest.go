@@ -574,6 +574,7 @@ func (srv *Server) handleREST(method, path, rawQuery, host string, body []byte) 
 			return jsonError(422, "Unprocessable Entity", "invalid ref or sha")
 		}
 		r.mu.Lock()
+		r.ensureMaterializedLocked()
 		if _, exists := r.Refs[req.Ref]; exists {
 			r.mu.Unlock()
 			return jsonError(422, "Unprocessable Entity", "Reference already exists")
@@ -615,6 +616,7 @@ func (srv *Server) handleREST(method, path, rawQuery, host string, body []byte) 
 		q, _ := url.ParseQuery(rawQuery)
 		shaParam := q.Get("sha")
 		r.mu.RLock()
+		r.ensureMaterializedLocked()
 		tip, ok := r.ResolveRefLocked(shaParam)
 		var out []map[string]any
 		if ok {
