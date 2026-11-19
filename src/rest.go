@@ -93,7 +93,7 @@ func buildIssueJSON(dst []byte, iss *Issue) []byte {
 
 func (iss *Issue) refreshCachedHTTP() []byte {
 	body := buildIssueJSON(make([]byte, 0, 96+len(iss.Title)+len(iss.Body)), iss)
-	resp200 := buildRawHTTPResponse(200, "OK", "application/json", body)
+	resp200 := buildFastHTTPResponse(200, "OK", "application/json", body)
 	iss.cachedGetHTTP.Store(&resp200)
 	return body
 }
@@ -264,7 +264,7 @@ func (srv *Server) FastCreateIssueHTTP(r *Repo, body []byte, scratch []byte) []b
 		var jBuf [1024]byte
 		jsonBody := buildIssueJSON(jBuf[:0], iss)
 		resp := scratch[:0]
-		resp = append(resp, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: 1\r\nContent-Length: "...)
+		resp = append(resp, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: "...)
 		resp = strconv.AppendInt(resp, int64(len(jsonBody)), 10)
 		resp = append(resp, "\r\n\r\n"...)
 		resp = append(resp, jsonBody...)

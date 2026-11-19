@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -62,25 +64,95 @@ func main() {
 	os.Exit(0)
 }
 
+func rawLocalHTTP(method, rawURL, contentType string, body []byte, timeout time.Duration) (int, []byte, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return 0, nil, err
+	}
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		host += ":80"
+	}
+	path := u.RequestURI()
+	if path == "" {
+		path = "/"
+	}
+
+	conn, err := net.DialTimeout("tcp", host, timeout)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	var req bytes.Buffer
+	req.WriteString(method)
+	req.WriteByte(' ')
+	req.WriteString(path)
+	req.WriteString(" HTTP/1.1\r\nHost: ")
+	req.WriteString(u.Host)
+	req.WriteString("\r\nConnection: close\r\n")
+	if contentType != "" {
+		req.WriteString("Content-Type: ")
+		req.WriteString(contentType)
+		req.WriteString("\r\n")
+	}
+	if len(body) > 0 {
+		req.WriteString("Content-Length: ")
+		req.WriteString(strconv.Itoa(len(body)))
+		req.WriteString("\r\n")
+	}
+	req.WriteString("\r\n")
+	if len(body) > 0 {
+		req.Write(body)
+	}
+
+	if _, err := conn.Write(req.Bytes()); err != nil {
+		return 0, nil, err
+	}
+	raw, err := io.ReadAll(conn)
+	if err != nil && len(raw) == 0 {
+		return 0, nil, err
+	}
+	hdrEnd := bytes.Index(raw, []byte("\r\n\r\n"))
+	if hdrEnd < 0 {
+		return 0, nil, fmt.Errorf("malformed HTTP response")
+	}
+	hdrBytes := raw[:hdrEnd]
+	respBody := raw[hdrEnd+4:]
+
+	firstLineEnd := bytes.Index(hdrBytes, []byte("\r\n"))
+	statusLine := hdrBytes
+	if firstLineEnd >= 0 {
+		statusLine = hdrBytes[:firstLineEnd]
+	}
+	parts := bytes.SplitN(statusLine, []byte(" "), 3)
+	if len(parts) < 2 {
+		return 0, nil, fmt.Errorf("malformed status line")
+	}
+	statusCode, err := strconv.Atoi(string(parts[1]))
+	if err != nil {
+		return 0, nil, err
+	}
+	if bytes.Contains(bytes.ToLower(hdrBytes), []byte("transfer-encoding: chunked")) {
+		if decoded, _, ok, _ := parseChunkedComplete(respBody); ok {
+			respBody = decoded
+		}
+	}
+	return statusCode, respBody, nil
+}
+
 func registerPort(envURL string, port int) error {
-	client := &http.Client{Timeout: 10 * time.Second}
 	body := []byte(fmt.Sprintf(`{"port":%d}`, port))
 	backoff := 50 * time.Millisecond
 	for attempt := 0; attempt < 60; attempt++ {
-		req, err := http.NewRequest("POST", envURL+"/register", bytes.NewReader(body))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
+		code, _, err := rawLocalHTTP("POST", envURL+"/register", "application/json", body, 10*time.Second)
 		if err == nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-			if resp.StatusCode == 200 || resp.StatusCode == 409 {
+			if code == 200 || code == 409 {
 				return nil
 			}
-			if resp.StatusCode == 400 || resp.StatusCode == 405 {
-				return fmt.Errorf("register rejected HTTP %d", resp.StatusCode)
+			if code == 400 || code == 405 {
+				return fmt.Errorf("register rejected HTTP %d", code)
 			}
 		}
 		time.Sleep(backoff)
@@ -92,17 +164,14 @@ func registerPort(envURL string, port int) error {
 }
 
 func pollDone(envURL string, doneCh chan<- struct{}) {
-	client := &http.Client{Timeout: 15 * time.Second}
 	type doneResp struct {
 		Done bool `json:"done"`
 	}
 	backoff := 1500 * time.Millisecond
 	for {
-		resp, err := client.Get(envURL + "/done")
+		code, data, err := rawLocalHTTP("GET", envURL+"/done", "", nil, 15*time.Second)
 		if err == nil {
-			data, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			if resp.StatusCode == 200 {
+			if code == 200 {
 				var dr doneResp
 				if json.Unmarshal(data, &dr) == nil && dr.Done {
 					close(doneCh)

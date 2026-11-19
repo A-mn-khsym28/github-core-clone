@@ -20,7 +20,7 @@ func init() {
 	v2Body = appendPktLineString(v2Body, "ls-refs=unborn\n")
 	v2Body = appendPktLineString(v2Body, "fetch=shallow filter\n")
 	v2Body = append(v2Body, "0000"...)
-	staticUploadPackV2AdvHTTP = buildRawHTTPResponse(200, "OK", "application/x-git-upload-pack-advertisement", v2Body)
+	staticUploadPackV2AdvHTTP = buildFastHTTPResponse(200, "OK", "application/x-git-upload-pack-advertisement", v2Body)
 
 	// Pre-bake static HTTP/1.1 response for single-ref ok refs/heads/main (side-band-64k)
 	var inner []byte
@@ -33,8 +33,23 @@ func init() {
 	copy(sbPayload[1:], inner)
 	sbBody = appendPktLine(sbBody, sbPayload)
 	sbBody = append(sbBody, "0000"...)
-	staticPushOkMainSidebandHTTP = buildRawHTTPResponse(200, "OK", "application/x-git-receive-pack-result", sbBody)
-	staticPushOkMainPlainHTTP = buildRawHTTPResponse(200, "OK", "application/x-git-receive-pack-result", inner)
+	staticPushOkMainSidebandHTTP = buildFastHTTPResponse(200, "OK", "application/x-git-receive-pack-result", sbBody)
+	staticPushOkMainPlainHTTP = buildFastHTTPResponse(200, "OK", "application/x-git-receive-pack-result", inner)
+}
+
+func buildFastHTTPResponse(status int, reason, contentType string, body []byte) []byte {
+	hdr := make([]byte, 0, 96+len(body))
+	hdr = append(hdr, "HTTP/1.1 "...)
+	hdr = strconv.AppendInt(hdr, int64(status), 10)
+	hdr = append(hdr, ' ')
+	hdr = append(hdr, reason...)
+	hdr = append(hdr, "\r\nContent-Type: "...)
+	hdr = append(hdr, contentType...)
+	hdr = append(hdr, "\r\nContent-Length: "...)
+	hdr = strconv.AppendInt(hdr, int64(len(body)), 10)
+	hdr = append(hdr, "\r\n\r\n"...)
+	hdr = append(hdr, body...)
+	return hdr
 }
 
 func buildRawHTTPResponse(status int, reason, contentType string, body []byte) []byte {
@@ -72,7 +87,7 @@ func (r *Repo) rebuildGitCachesLocked() {
 				oidInBody := len(body)
 				body = append(body, ZeroHex...)
 				body = append(body, " refs/heads/main\x00"+caps+"\n0000"...)
-				full := buildRawHTTPResponse(200, "OK", "application/x-git-receive-pack-advertisement", body)
+				full := buildFastHTTPResponse(200, "OK", "application/x-git-receive-pack-advertisement", body)
 				r.recvMainOIDOfs = len(full) - len(body) + oidInBody
 				r.recvMainHTTP = full
 			}
@@ -384,7 +399,7 @@ func (srv *Server) handleUploadPackV2(r *Repo, body []byte) []byte {
 		r.mu.RLock()
 		resp := r.buildLsRefsLocked(peel, symrefs, unborn, prefixes)
 		r.mu.RUnlock()
-		httpResp := buildRawHTTPResponse(200, "OK", "application/x-git-upload-pack-result", resp)
+		httpResp := buildFastHTTPResponse(200, "OK", "application/x-git-upload-pack-result", resp)
 		reqCopy := make([]byte, len(body))
 		copy(reqCopy, body)
 		r.lsRefsReqCache.Store(&RawReqRespCache{ReqBody: reqCopy, HTTPResp: httpResp})
@@ -448,7 +463,7 @@ func (srv *Server) handleUploadPackV2(r *Repo, body []byte) []byte {
 		resp = appendPktLineString(resp, "packfile\n")
 		resp = appendSidebandPack(resp, pack)
 		resp = append(resp, "0000"...)
-		httpResp := buildRawHTTPResponse(200, "OK", "application/x-git-upload-pack-result", resp)
+		httpResp := buildFastHTTPResponse(200, "OK", "application/x-git-upload-pack-result", resp)
 
 		if len(haves) == 0 && len(clientShallows) == 0 {
 			reqCopy := make([]byte, len(body))
