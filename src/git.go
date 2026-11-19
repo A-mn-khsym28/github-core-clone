@@ -17,10 +17,8 @@ func init() {
 	// Pre-bake static HTTP/1.1 response for protocol v2 git-upload-pack advertisement
 	var v2Body []byte
 	v2Body = appendPktLineString(v2Body, "version 2\n")
-	v2Body = appendPktLineString(v2Body, "agent=forge/1.0\n")
 	v2Body = appendPktLineString(v2Body, "ls-refs=unborn\n")
 	v2Body = appendPktLineString(v2Body, "fetch=shallow filter\n")
-	v2Body = appendPktLineString(v2Body, "object-format=sha1\n")
 	v2Body = append(v2Body, "0000"...)
 	staticUploadPackV2AdvHTTP = buildRawHTTPResponse(200, "OK", "application/x-git-upload-pack-advertisement", v2Body)
 
@@ -57,41 +55,65 @@ func buildRawHTTPResponse(status int, reason, contentType string, body []byte) [
 // rebuildGitCachesLocked refreshes the pre-baked HTTP/1.1 receive-pack advertisement buffer
 // and invalidates lazy upload-pack caches. Caller must hold r.mu.Lock().
 func (r *Repo) rebuildGitCachesLocked() {
-	var recvBody []byte
 	if len(r.Refs) == 1 {
 		if oid, ok := r.Refs["refs/heads/main"]; ok {
-			const caps = "report-status side-band-64k delete-refs ofs-delta agent=forge/1.0"
-			const prefix = "001f# service=git-receive-pack\n0000"
-			const lineLen = 4 + 40 + 1 + len("refs/heads/main") + 1 + len(caps) + 1
-			buf := make([]byte, 0, len(prefix)+lineLen+4)
-			buf = append(buf, prefix...)
-			buf = append(buf,
-				hexDigits[(lineLen>>12)&0xf],
-				hexDigits[(lineLen>>8)&0xf],
-				hexDigits[(lineLen>>4)&0xf],
-				hexDigits[lineLen&0xf],
-			)
-			var hexOID [40]byte
-			for i, b := range oid {
-				hexOID[i*2] = hexDigits[b>>4]
-				hexOID[i*2+1] = hexDigits[b&0xf]
+			if r.recvMainHTTP == nil {
+				const caps = "report-status side-band-64k delete-refs ofs-delta"
+				const prefix = "001f# service=git-receive-pack\n0000"
+				const lineLen = 4 + 40 + 1 + len("refs/heads/main") + 1 + len(caps) + 1
+				body := make([]byte, 0, len(prefix)+lineLen+4)
+				body = append(body, prefix...)
+				body = append(body,
+					hexDigits[(lineLen>>12)&0xf],
+					hexDigits[(lineLen>>8)&0xf],
+					hexDigits[(lineLen>>4)&0xf],
+					hexDigits[lineLen&0xf],
+				)
+				oidInBody := len(body)
+				body = append(body, ZeroHex...)
+				body = append(body, " refs/heads/main\x00"+caps+"\n0000"...)
+				full := buildRawHTTPResponse(200, "OK", "application/x-git-receive-pack-advertisement", body)
+				r.recvMainOIDOfs = len(full) - len(body) + oidInBody
+				r.recvMainHTTP = full
 			}
-			buf = append(buf, hexOID[:]...)
-			buf = append(buf, " refs/heads/main\x00"+caps+"\n0000"...)
-			recvBody = buf
+			dst := r.recvMainHTTP[r.recvMainOIDOfs : r.recvMainOIDOfs+40]
+			for i, b := range oid {
+				dst[i*2] = hexDigits[b>>4]
+				dst[i*2+1] = hexDigits[b&0xf]
+			}
+			r.recvRefsCache.Store(&r.recvMainHTTP)
+			if r.lsRefsCache.Load() != nil {
+				r.lsRefsCache.Store(nil)
+			}
+			if r.lsRefsReqCache.Load() != nil {
+				r.lsRefsReqCache.Store(nil)
+			}
+			if r.fetchReqCache.Load() != nil {
+				r.fetchReqCache.Store(nil)
+			}
+			if r.shallowFetchCache.Load() != nil {
+				r.shallowFetchCache.Store(nil)
+			}
+			return
 		}
 	}
-	if recvBody == nil {
-		recvBody = r.buildReceivePackAdvLocked()
-	}
+	recvBody := r.buildReceivePackAdvLocked()
 	recvHTTP := buildRawHTTPResponse(200, "OK", "application/x-git-receive-pack-advertisement", recvBody)
 	r.recvRefsCache.Store(&recvHTTP)
 
 	// Lazily invalidate upload-pack caches (avoids rebuilding ls-refs during push-only workloads!)
-	r.lsRefsCache.Store(nil)
-	r.lsRefsReqCache.Store(nil)
-	r.fetchReqCache.Store(nil)
-	r.shallowFetchCache.Store(nil)
+	if r.lsRefsCache.Load() != nil {
+		r.lsRefsCache.Store(nil)
+	}
+	if r.lsRefsReqCache.Load() != nil {
+		r.lsRefsReqCache.Store(nil)
+	}
+	if r.fetchReqCache.Load() != nil {
+		r.fetchReqCache.Store(nil)
+	}
+	if r.shallowFetchCache.Load() != nil {
+		r.shallowFetchCache.Store(nil)
+	}
 }
 
 func (r *Repo) sortedRefNamesLocked() []string {

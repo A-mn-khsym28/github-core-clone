@@ -238,6 +238,8 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 	if !hasDeltas {
 		h := sha1Pool.Get().(hash.Hash)
 		var hdrBuf [32]byte
+		objSlab := make([]GitObject, numObjects)
+		slabIdx := 0
 		for i := range entries {
 			e := &entries[i]
 			h.Reset()
@@ -256,12 +258,12 @@ func ParsePackLocked(r *Repo, pack []byte) ([]*GitObject, error) {
 				}
 				continue
 			}
-			obj := &GitObject{
-				Type: e.objType,
-				OID:  oid,
-				Data: e.data,
-				Zlib: e.zlibBytes,
-			}
+			obj := &objSlab[slabIdx]
+			slabIdx++
+			obj.Type = e.objType
+			obj.OID = oid
+			obj.Data = e.data
+			obj.Zlib = e.zlibBytes
 			if e.objType == ObjCommit {
 				parseCommitMeta(obj)
 			} else if e.objType == ObjTag {

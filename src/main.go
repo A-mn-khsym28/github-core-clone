@@ -59,6 +59,7 @@ func main() {
 	case <-sigCh:
 	}
 	_ = syscall.Close(listenFD)
+	os.Exit(0)
 }
 
 func registerPort(envURL string, port int) error {
@@ -95,7 +96,7 @@ func pollDone(envURL string, doneCh chan<- struct{}) {
 	type doneResp struct {
 		Done bool `json:"done"`
 	}
-	backoff := 800 * time.Millisecond
+	backoff := 1500 * time.Millisecond
 	for {
 		resp, err := client.Get(envURL + "/done")
 		if err == nil {
@@ -108,9 +109,9 @@ func pollDone(envURL string, doneCh chan<- struct{}) {
 					return
 				}
 			}
-			backoff = 800 * time.Millisecond
+			backoff = 1500 * time.Millisecond
 		} else {
-			if backoff < time.Second {
+			if backoff < 2*time.Second {
 				backoff *= 2
 			}
 		}

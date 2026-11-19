@@ -116,6 +116,8 @@ type Repo struct {
 
 	// Atomic hot-path HTTP response caches (complete HTTP/1.1 bytes, 100% lock-free reads!)
 	recvRefsCache     atomic.Pointer[[]byte]
+	recvMainHTTP      []byte // Reusable single-ref HTTP/1.1 response updated in-place on push
+	recvMainOIDOfs    int
 	lsRefsCache       atomic.Pointer[[]byte]
 	lsRefsReqCache    atomic.Pointer[RawReqRespCache]
 	fetchReqCache     atomic.Pointer[RawReqRespCache]
