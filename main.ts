@@ -22,7 +22,7 @@ function resolveBinary(): string {
 const binPath = resolveBinary();
 const child = spawn(binPath, [], {
   stdio: 'inherit',
-  env: { ...process.env, GODEBUG: 'asyncpreemptoff=1' },
+  env: process.env,
 });
 
 const forwardSignal = (sig: NodeJS.Signals): void => {
