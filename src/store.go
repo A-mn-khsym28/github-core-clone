@@ -113,6 +113,8 @@ type Repo struct {
 	Objects      map[[20]byte]*GitObject
 	hasPending   atomic.Bool
 	pendingPacks [][]byte // Deferred raw pack bodies (without 20B trailer) materialized lazily on object reads
+	packArena    []byte   // Reusable slab arena for zero-alloc push pack copies & commit bytes
+	objArena     []GitObject
 	Refs         map[string][20]byte
 	RefGen       uint64
 	CommitSeq    int

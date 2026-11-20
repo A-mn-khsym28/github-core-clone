@@ -184,6 +184,13 @@ func TryFastPushCommitLocked(r *Repo, pack []byte, oldOID, newOID [20]byte) (boo
 		return false, errors.New("pack checksum mismatch")
 	}
 
+	if cap(r.packArena)-len(r.packArena) < bodyEnd+4096 {
+		sz := 262144
+		if bodyEnd+4096 > sz {
+			sz = bodyEnd + 4096
+		}
+		r.packArena = make([]byte, 0, sz)
+	}
 	scanLo := bodyEnd - 1024
 	if scanLo < 13 {
 		scanLo = 13
@@ -228,8 +235,10 @@ func TryFastPushCommitLocked(r *Repo, pack []byte, oldOID, newOID [20]byte) (boo
 			if size < 40 || size > 65536 {
 				continue
 			}
-			raw, nextPos, err := inflateZlibInto(pack, zStart, size, nil)
+			arenaMark := len(r.packArena)
+			raw, nextPos, err := inflateZlibInto(pack, zStart, size, &r.packArena)
 			if err != nil || nextPos != bodyEnd {
+				r.packArena = r.packArena[:arenaMark]
 				continue
 			}
 			// Cryptographic SHA-1 proof that this is genuinely the commit for newOID
@@ -243,14 +252,14 @@ func TryFastPushCommitLocked(r *Repo, pack []byte, oldOID, newOID [20]byte) (boo
 			var oid [20]byte
 			h.Sum(oid[:0])
 			if oid != newOID {
+				r.packArena = r.packArena[:arenaMark]
 				continue
 			}
 
-			obj := &GitObject{
-				Type: ObjCommit,
-				OID:  oid,
-				Data: raw,
-			}
+			obj := r.allocGitObjectLocked()
+			obj.Type = ObjCommit
+			obj.OID = oid
+			obj.Data = raw
 			parseCommitMeta(obj)
 			if oldOID != ZeroOID {
 				isDirectParent := false
@@ -261,11 +270,12 @@ func TryFastPushCommitLocked(r *Repo, pack []byte, oldOID, newOID [20]byte) (boo
 					}
 				}
 				if !isDirectParent {
+					r.packArena = r.packArena[:arenaMark]
 					return false, nil
 				}
 			}
 
-			packOwned := make([]byte, bodyEnd)
+			packOwned := r.allocArenaBytesLocked(bodyEnd)
 			copy(packOwned, pack[:bodyEnd])
 			obj.Zlib = packOwned[zStart:bodyEnd]
 			r.Objects[oid] = obj
@@ -278,6 +288,28 @@ func TryFastPushCommitLocked(r *Repo, pack []byte, oldOID, newOID [20]byte) (boo
 }
 
 // ensureMaterialized safely unpacks all deferred packs under r.mu.Lock() (call BEFORE r.mu.RLock()).
+
+func (r *Repo) allocArenaBytesLocked(n int) []byte {
+	if cap(r.packArena)-len(r.packArena) < n {
+		sz := 262144
+		if n > sz {
+			sz = n
+		}
+		r.packArena = make([]byte, 0, sz)
+	}
+	base := len(r.packArena)
+	r.packArena = r.packArena[:base+n]
+	return r.packArena[base : base+n : base+n]
+}
+
+func (r *Repo) allocGitObjectLocked() *GitObject {
+	if len(r.objArena) == cap(r.objArena) {
+		r.objArena = make([]GitObject, 0, 128)
+	}
+	idx := len(r.objArena)
+	r.objArena = r.objArena[:idx+1]
+	return &r.objArena[idx]
+}
 func (r *Repo) ensureMaterialized() {
 	if !r.hasPending.Load() {
 		return
