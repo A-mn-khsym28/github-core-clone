@@ -72,7 +72,7 @@ func buildRawHTTPResponse(status int, reason, contentType string, body []byte) [
 func (r *Repo) rebuildGitCachesLocked() {
 	if len(r.Refs) == 1 {
 		if oid, ok := r.Refs["refs/heads/main"]; ok {
-			if r.recvMainHTTP == nil {
+			if r.recvMainHTTP[0] == nil {
 				const caps = "report-status side-band-64k delete-refs ofs-delta"
 				const prefix = "001f# service=git-receive-pack\n0000"
 				const lineLen = 4 + 40 + 1 + len("refs/heads/main") + 1 + len(caps) + 1
@@ -87,16 +87,21 @@ func (r *Repo) rebuildGitCachesLocked() {
 				oidInBody := len(body)
 				body = append(body, ZeroHex...)
 				body = append(body, " refs/heads/main\x00"+caps+"\n0000"...)
-				full := buildFastHTTPResponse(200, "OK", "application/x-git-receive-pack-advertisement", body)
-				r.recvMainOIDOfs = len(full) - len(body) + oidInBody
-				r.recvMainHTTP = full
+				full0 := buildFastHTTPResponse(200, "OK", "application/x-git-receive-pack-advertisement", body)
+				full1 := make([]byte, len(full0))
+				copy(full1, full0)
+				r.recvMainOIDOfs = len(full0) - len(body) + oidInBody
+				r.recvMainHTTP[0] = full0
+				r.recvMainHTTP[1] = full1
 			}
-			dst := r.recvMainHTTP[r.recvMainOIDOfs : r.recvMainOIDOfs+40]
+			r.recvMainSlot ^= 1
+			slot := r.recvMainSlot
+			dst := r.recvMainHTTP[slot][r.recvMainOIDOfs : r.recvMainOIDOfs+40]
 			for i, b := range oid {
 				dst[i*2] = hexDigits[b>>4]
 				dst[i*2+1] = hexDigits[b&0xf]
 			}
-			r.recvRefsCache.Store(&r.recvMainHTTP)
+			r.recvRefsCache.Store(&r.recvMainHTTP[slot])
 			if r.lsRefsCache.Load() != nil {
 				r.lsRefsCache.Store(nil)
 			}
@@ -141,7 +146,6 @@ func (r *Repo) sortedRefNamesLocked() []string {
 }
 
 func (r *Repo) peelTagLocked(oid [20]byte) ([20]byte, bool) {
-	r.ensureMaterializedLocked()
 	obj := r.Objects[oid]
 	if obj == nil || obj.Type != ObjTag {
 		return ZeroOID, false
@@ -288,6 +292,7 @@ func (srv *Server) handleGitInfoRefs(r *Repo, query, gitProto []byte) []byte {
 		if bytes.Contains(gitProto, []byte("version=2")) {
 			return staticUploadPackV2AdvHTTP
 		}
+		r.ensureMaterialized()
 		r.mu.RLock()
 		body := r.buildUploadPackV0AdvLocked()
 		r.mu.RUnlock()
@@ -396,6 +401,7 @@ func (srv *Server) handleUploadPackV2(r *Repo, body []byte) []byte {
 				return *p
 			}
 		}
+		r.ensureMaterialized()
 		r.mu.RLock()
 		resp := r.buildLsRefsLocked(peel, symrefs, unborn, prefixes)
 		r.mu.RUnlock()
@@ -444,6 +450,7 @@ func (srv *Server) handleUploadPackV2(r *Repo, body []byte) []byte {
 			}
 		}
 
+		r.ensureMaterialized()
 		r.mu.RLock()
 		objs, newShallows, unshallows := r.collectFetchObjectsLocked(wants, haves, clientShallows, depth, filter)
 		pack := BuildPack(objs)
@@ -527,6 +534,7 @@ func (srv *Server) handleUploadPackV0(r *Repo, body []byte) []byte {
 		}
 	}
 
+	r.ensureMaterialized()
 	r.mu.RLock()
 	objs, newShallows, unshallows := r.collectFetchObjectsLocked(wants, haves, clientShallows, depth, "")
 	pack := BuildPack(objs)
@@ -555,7 +563,6 @@ func (r *Repo) collectFetchObjectsLocked(
 	depth int,
 	filter string,
 ) (objects []*GitObject, newShallows [][20]byte, unshallows [][20]byte) {
-	r.ensureMaterializedLocked()
 	skipBlobs := filter == "blob:none"
 	clientShallowSet := make(map[[20]byte]struct{}, len(clientShallows))
 	for _, s := range clientShallows {

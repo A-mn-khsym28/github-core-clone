@@ -270,15 +270,27 @@ func TryFastPushCommitLocked(r *Repo, pack []byte, oldOID, newOID [20]byte) (boo
 			obj.Zlib = packOwned[zStart:bodyEnd]
 			r.Objects[oid] = obj
 			r.pendingPacks = append(r.pendingPacks, packOwned)
+			r.hasPending.Store(true)
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-// ensureMaterializedLocked unpacks all deferred packs into r.Objects (caller holds r.mu or single-threaded epoll).
+// ensureMaterialized safely unpacks all deferred packs under r.mu.Lock() (call BEFORE r.mu.RLock()).
+func (r *Repo) ensureMaterialized() {
+	if !r.hasPending.Load() {
+		return
+	}
+	r.mu.Lock()
+	r.ensureMaterializedLocked()
+	r.mu.Unlock()
+}
+
+// ensureMaterializedLocked unpacks all deferred packs into r.Objects (caller MUST hold r.mu.Lock()).
 func (r *Repo) ensureMaterializedLocked() {
 	if len(r.pendingPacks) == 0 {
+		r.hasPending.Store(false)
 		return
 	}
 	packs := r.pendingPacks
@@ -286,6 +298,7 @@ func (r *Repo) ensureMaterializedLocked() {
 	for _, p := range packs {
 		_, _ = parsePackOwnedLocked(r, p)
 	}
+	r.hasPending.Store(false)
 }
 
 func parsePackOwnedLocked(r *Repo, packOwned []byte) ([]*GitObject, error) {

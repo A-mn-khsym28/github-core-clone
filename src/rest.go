@@ -616,7 +616,6 @@ func (srv *Server) handleREST(method, path, rawQuery, host string, body []byte) 
 		q, _ := url.ParseQuery(rawQuery)
 		shaParam := q.Get("sha")
 		r.mu.RLock()
-		r.ensureMaterializedLocked()
 		tip, ok := r.ResolveRefLocked(shaParam)
 		var out []map[string]any
 		if ok {

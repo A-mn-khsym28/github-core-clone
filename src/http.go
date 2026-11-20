@@ -55,6 +55,18 @@ type connState struct {
 	lastRepo     *Repo
 }
 
+func (c *connState) reset(fd int) {
+	c.fd = fd
+	c.rPos = 0
+	c.wPos = 0
+	c.pendingWrite = nil
+	c.closeAfter = false
+	c.wantOut = false
+	c.lastOwnerLen = 0
+	c.lastRepoLen = 0
+	c.lastRepo = nil
+}
+
 func (c *connState) lookupRepo(srv *Server, owner, repoName []byte) *Repo {
 	if c.lastRepo != nil && !c.lastRepo.deleted.Load() &&
 		len(owner) == c.lastOwnerLen && len(repoName) == c.lastRepoLen &&
@@ -73,89 +85,99 @@ func (c *connState) lookupRepo(srv *Server, owner, repoName []byte) *Repo {
 	return r
 }
 
-type Server struct {
-	store       *Store
+type epollWorker struct {
+	srv         *Server
+	epfd        int
+	listenFD    int
+	peerEPFD    int
+	rr          int
+	activeConns int
 	scratch     []byte
 	connsArr    [512]*connState
 	connsMap    map[int]*connState
 	freeConns   []*connState
-	activeConns int
 }
 
-func NewServer(store *Store) *Server {
-	srv := &Server{
-		store:     store,
+func newEpollWorker(srv *Server, listenFD, peerEPFD int) (*epollWorker, error) {
+	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	if err != nil {
+		return nil, err
+	}
+	w := &epollWorker{
+		srv:       srv,
+		epfd:      epfd,
+		listenFD:  listenFD,
+		peerEPFD:  peerEPFD,
 		scratch:   make([]byte, 0, 16384),
 		connsMap:  make(map[int]*connState, 16),
-		freeConns: make([]*connState, 0, 64),
+		freeConns: make([]*connState, 0, 32),
 	}
-	// Pre-warm 64 connection structs + 16 KiB buffers at startup (0 page faults on 50-clone burst!)
-	for i := 0; i < 64; i++ {
-		srv.freeConns = append(srv.freeConns, &connState{
+	for i := 0; i < 32; i++ {
+		w.freeConns = append(w.freeConns, &connState{
 			fd:  -1,
 			buf: make([]byte, 16384),
 		})
 	}
-	return srv
+	return w, nil
 }
 
-func (srv *Server) allocConn(fd int) *connState {
+func (w *epollWorker) allocConn(fd int) *connState {
 	var c *connState
-	if n := len(srv.freeConns); n > 0 {
-		c = srv.freeConns[n-1]
-		srv.freeConns = srv.freeConns[:n-1]
-		c.fd = fd
-		c.rPos = 0
-		c.wPos = 0
-		c.pendingWrite = nil
-		c.closeAfter = false
-		c.wantOut = false
-		c.lastOwnerLen = 0
-		c.lastRepoLen = 0
-		c.lastRepo = nil
+	if n := len(w.freeConns); n > 0 {
+		c = w.freeConns[n-1]
+		w.freeConns = w.freeConns[:n-1]
+		c.reset(fd)
 	} else {
 		c = &connState{
 			fd:  fd,
 			buf: make([]byte, 16384),
 		}
 	}
-	if fd >= 0 && fd < len(srv.connsArr) {
-		srv.connsArr[fd] = c
+	if fd >= 0 && fd < len(w.connsArr) {
+		w.connsArr[fd] = c
 	} else {
-		srv.connsMap[fd] = c
+		w.connsMap[fd] = c
 	}
-	srv.activeConns++
+	w.activeConns++
 	return c
 }
 
-func (srv *Server) getConn(fd int) *connState {
-	if fd >= 0 && fd < len(srv.connsArr) {
-		return srv.connsArr[fd]
+func (w *epollWorker) getConn(fd int) *connState {
+	if fd >= 0 && fd < len(w.connsArr) {
+		return w.connsArr[fd]
 	}
-	return srv.connsMap[fd]
+	return w.connsMap[fd]
 }
 
-func (srv *Server) closeConn(c *connState) {
+func (w *epollWorker) closeConn(c *connState) {
 	fd := c.fd
 	if fd < 0 {
 		return
 	}
-	if fd < len(srv.connsArr) {
-		srv.connsArr[fd] = nil
+	if fd < len(w.connsArr) {
+		w.connsArr[fd] = nil
 	} else {
-		delete(srv.connsMap, fd)
+		delete(w.connsMap, fd)
 	}
 	c.fd = -1
-	srv.activeConns--
+	w.activeConns--
 	_, _, _ = syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(fd), 0, 0)
 	c.pendingWrite = nil
 	c.lastRepo = nil
 	if len(c.buf) > 65536 {
 		c.buf = make([]byte, 16384)
 	}
-	if len(srv.freeConns) < 128 {
-		srv.freeConns = append(srv.freeConns, c)
+	if len(w.freeConns) < 64 {
+		w.freeConns = append(w.freeConns, c)
 	}
+}
+
+type Server struct {
+	store *Store
+}
+
+func NewServer(store *Store) *Server {
+	return &Server{store: store}
 }
 
 func listenRawTCP() (int, int, error) {
@@ -200,7 +222,7 @@ func rawEpollCtl(epfd, op, fd int, events uint32) syscall.Errno {
 	return errno
 }
 
-func rawNonBlockRead(fd int, p []byte) (int, syscall.Errno) {
+func rawReadFD(fd int, p []byte) (int, syscall.Errno) {
 	for {
 		r1, _, errno := syscall.RawSyscall(
 			syscall.SYS_READ,
@@ -218,7 +240,7 @@ func rawNonBlockRead(fd int, p []byte) (int, syscall.Errno) {
 	}
 }
 
-func rawNonBlockWrite(fd int, p []byte) (int, syscall.Errno) {
+func rawWriteFD(fd int, p []byte) (int, syscall.Errno) {
 	for {
 		r1, _, errno := syscall.RawSyscall(
 			syscall.SYS_WRITE,
@@ -236,32 +258,48 @@ func rawNonBlockWrite(fd int, p []byte) (int, syscall.Errno) {
 	}
 }
 
-// ServeFD runs a single-threaded raw Linux epoll event loop pinned to one OS thread.
-// Zero Go netpoller, zero goroutine-per-conn, zero thread spawns on clone bursts,
-// zero socket lock contention (3 raw syscalls/req total).
+// ServeFD runs a dual-core raw Linux epoll reactor:
+//   - Worker 0 accepts connections and serves single-connection workloads (read/write/push)
+//     locally with zero cross-thread handoff while Worker 1 sleeps quietly in Syscall6(EPOLL_PWAIT).
+//   - When concurrent connections arrive (clone burst), Worker 0 distributes overflow sockets
+//     to Worker 1's epfd for full 2-CPU parallelism with zero OS thread spawns.
+//   - Blocking EPOLL_PWAIT uses Syscall6 (proper entersyscall -> zero sysmon spin, zero SIGURG);
+//     all non-blocking read/write/accept4/epoll_ctl/setsockopt/close calls use RawSyscall.
 func (srv *Server) ServeFD(listenFD int) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	epfd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
+	w1, err := newEpollWorker(srv, -1, -1)
 	if err != nil {
 		return
 	}
-	defer func() { _ = syscall.Close(epfd) }()
-
-	if errno := rawEpollCtl(epfd, syscall.EPOLL_CTL_ADD, listenFD, syscall.EPOLLIN); errno != 0 {
+	w0, err := newEpollWorker(srv, listenFD, w1.epfd)
+	if err != nil {
+		_ = syscall.Close(w1.epfd)
 		return
 	}
+	if rawEpollCtl(w0.epfd, syscall.EPOLL_CTL_ADD, listenFD, syscall.EPOLLIN) != 0 {
+		_ = syscall.Close(w0.epfd)
+		_ = syscall.Close(w1.epfd)
+		return
+	}
+
+	go w1.run()
+	w0.run()
+}
+
+func (w *epollWorker) run() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	defer func() { _ = syscall.Close(w.epfd) }()
 
 	var events [64]syscall.EpollEvent
 	one := int32(1)
 	negOne := ^uintptr(0)
-	var hotConn *connState
 
 	for {
-		r1, _, errno := syscall.RawSyscall6(
+		// Use Syscall6 for the blocking wait so Go's runtime transitions P to _Psyscall cleanly
+		// (prevents sysmon 20us spinning and SIGURG/EINTR storms while keeping 0% idle CPU!).
+		r1, _, errno := syscall.Syscall6(
 			syscall.SYS_EPOLL_PWAIT,
-			uintptr(epfd),
+			uintptr(w.epfd),
 			uintptr(unsafe.Pointer(&events[0])),
 			uintptr(len(events)),
 			negOne,
@@ -275,121 +313,113 @@ func (srv *Server) ServeFD(listenFD int) {
 			return
 		}
 		n := int(r1)
-		if n > 0 {
-			srv.dispatchEvents(epfd, listenFD, events[:n], &hotConn, &one)
-		}
-	}
-}
+		for i := 0; i < n; i++ {
+			fd := int(events[i].Fd)
+			ev := events[i].Events
 
-func (srv *Server) dispatchEvents(epfd, listenFD int, evs []syscall.EpollEvent, hotConn **connState, one *int32) {
-	for i := 0; i < len(evs); i++ {
-		fd := int(evs[i].Fd)
-		ev := evs[i].Events
-		if fd == listenFD {
-			for {
-				cr1, _, cerr := syscall.RawSyscall6(
-					syscall.SYS_ACCEPT4,
-					uintptr(listenFD),
-					0,
-					0,
-					uintptr(syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC),
-					0,
-					0,
-				)
-				if cerr != 0 {
-					if cerr == syscall.EINTR {
+			if w.listenFD >= 0 && fd == w.listenFD {
+				for {
+					cr1, _, cerr := syscall.RawSyscall6(
+						syscall.SYS_ACCEPT4,
+						uintptr(w.listenFD),
+						0,
+						0,
+						uintptr(syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC),
+						0,
+						0,
+					)
+					if cerr != 0 {
+						if cerr == syscall.EINTR {
+							continue
+						}
+						break
+					}
+					cfd := int(cr1)
+					_, _, _ = syscall.RawSyscall6(
+						syscall.SYS_SETSOCKOPT,
+						uintptr(cfd),
+						uintptr(syscall.IPPROTO_TCP),
+						uintptr(syscall.TCP_NODELAY),
+						uintptr(unsafe.Pointer(&one)),
+						4,
+						0,
+					)
+					// Keep single-connection workloads local on Worker 0; spread concurrent bursts across both CPUs!
+					if w.peerEPFD >= 0 && w.activeConns >= 1 && (w.rr&1) == 1 {
+						w.rr++
+						if rawEpollCtl(w.peerEPFD, syscall.EPOLL_CTL_ADD, cfd, syscall.EPOLLIN) != 0 {
+							_, _, _ = syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(cfd), 0, 0)
+						}
 						continue
 					}
-					break
-				}
-				cfd := int(cr1)
-				_, _, _ = syscall.RawSyscall6(
-					syscall.SYS_SETSOCKOPT,
-					uintptr(cfd),
-					uintptr(syscall.IPPROTO_TCP),
-					uintptr(syscall.TCP_NODELAY),
-					uintptr(unsafe.Pointer(one)),
-					4,
-					0,
-				)
-				if rawEpollCtl(epfd, syscall.EPOLL_CTL_ADD, cfd, syscall.EPOLLIN) != 0 {
-					_, _, _ = syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(cfd), 0, 0)
-					continue
-				}
-				c := srv.allocConn(cfd)
-				*hotConn = c
-			}
-			continue
-		}
-
-		c := srv.getConn(fd)
-		if c == nil {
-			continue
-		}
-		if (ev&(syscall.EPOLLERR|syscall.EPOLLHUP)) != 0 && (ev&syscall.EPOLLIN) == 0 {
-			if *hotConn == c {
-				*hotConn = nil
-			}
-			srv.closeConn(c)
-			continue
-		}
-		if (ev & syscall.EPOLLOUT) != 0 {
-			srv.flushPending(epfd, c)
-			if c.fd < 0 {
-				if *hotConn == c {
-					*hotConn = nil
+					w.rr++
+					if rawEpollCtl(w.epfd, syscall.EPOLL_CTL_ADD, cfd, syscall.EPOLLIN) != 0 {
+						_, _, _ = syscall.RawSyscall(syscall.SYS_CLOSE, uintptr(cfd), 0, 0)
+						continue
+					}
+					w.allocConn(cfd)
 				}
 				continue
 			}
-		}
-		if (ev & syscall.EPOLLIN) != 0 {
-			srv.onReadable(epfd, c)
-			if c.fd >= 0 {
-				*hotConn = c
-			} else if *hotConn == c {
-				*hotConn = nil
+
+			c := w.getConn(fd)
+			if c == nil {
+				c = w.allocConn(fd)
+			}
+			if (ev&(syscall.EPOLLERR|syscall.EPOLLHUP)) != 0 && (ev&syscall.EPOLLIN) == 0 {
+				w.closeConn(c)
+				continue
+			}
+			if (ev & syscall.EPOLLOUT) != 0 {
+				w.flushPending(c)
+				if c.fd < 0 {
+					continue
+				}
+			}
+			if (ev & syscall.EPOLLIN) != 0 {
+				w.onReadable(c)
 			}
 		}
 	}
 }
 
-func (srv *Server) flushPending(epfd int, c *connState) {
+func (w *epollWorker) flushPending(c *connState) {
 	for len(c.pendingWrite) > 0 {
-		n, errno := rawNonBlockWrite(c.fd, c.pendingWrite)
+		n, errno := rawWriteFD(c.fd, c.pendingWrite)
 		if errno == syscall.EAGAIN {
 			return
 		}
 		if errno != 0 || n <= 0 {
-			srv.closeConn(c)
+			w.closeConn(c)
 			return
 		}
 		c.pendingWrite = c.pendingWrite[n:]
 	}
 	if c.closeAfter {
-		srv.closeConn(c)
+		w.closeConn(c)
 		return
 	}
 	if c.wantOut {
 		c.wantOut = false
-		_ = rawEpollCtl(epfd, syscall.EPOLL_CTL_MOD, c.fd, syscall.EPOLLIN)
+		_ = rawEpollCtl(w.epfd, syscall.EPOLL_CTL_MOD, c.fd, syscall.EPOLLIN)
 	}
 	if c.wPos > c.rPos {
-		srv.processBuffered(epfd, c)
+		w.processBuffered(c)
 	}
 }
 
-func (srv *Server) sendResp(epfd int, c *connState, resp []byte, closeAfter bool) bool {
+func (w *epollWorker) sendResp(c *connState, resp []byte, closeAfter bool) bool {
 	if len(resp) > 0 {
-		n, errno := rawNonBlockWrite(c.fd, resp)
+		n, errno := rawWriteFD(c.fd, resp)
 		if errno == 0 && n == len(resp) {
 			if closeAfter {
-				srv.closeConn(c)
+				w.closeConn(c)
 				return false
 			}
 			return true
 		}
 		if errno != 0 && errno != syscall.EAGAIN {
-			srv.closeConn(c)
+			w.closeConn(c)
 			return false
 		}
 		rem := resp[n:]
@@ -399,20 +429,20 @@ func (srv *Server) sendResp(epfd int, c *connState, resp []byte, closeAfter bool
 		c.closeAfter = closeAfter
 		if !c.wantOut {
 			c.wantOut = true
-			_ = rawEpollCtl(epfd, syscall.EPOLL_CTL_MOD, c.fd, syscall.EPOLLIN|syscall.EPOLLOUT)
+			_ = rawEpollCtl(w.epfd, syscall.EPOLL_CTL_MOD, c.fd, syscall.EPOLLIN|syscall.EPOLLOUT)
 		}
 		return false
 	}
 	if closeAfter {
-		srv.closeConn(c)
+		w.closeConn(c)
 		return false
 	}
 	return true
 }
 
-func (srv *Server) onReadable(epfd int, c *connState) {
+func (w *epollWorker) onReadable(c *connState) {
 	if len(c.pendingWrite) > 0 {
-		srv.flushPending(epfd, c)
+		w.flushPending(c)
 		if c.fd < 0 || len(c.pendingWrite) > 0 {
 			return
 		}
@@ -429,41 +459,20 @@ func (srv *Server) onReadable(epfd int, c *connState) {
 			c.buf = nb
 		}
 	}
-	n, errno := rawNonBlockRead(c.fd, c.buf[c.wPos:])
+	n, errno := rawReadFD(c.fd, c.buf[c.wPos:])
 	if errno == syscall.EAGAIN {
 		return
 	}
 	if errno != 0 || n == 0 {
-		srv.closeConn(c)
+		w.closeConn(c)
 		return
 	}
 	c.wPos += n
-	srv.processBuffered(epfd, c)
+	w.processBuffered(c)
 }
 
-func (srv *Server) verifyAuthSIMD(hdrBlock []byte) bool {
-	if srv.store.Token == "" {
-		return true
-	}
-	idx := bytes.Index(hdrBlock, srv.store.AuthHeader)
-	if idx < 15 {
-		return false
-	}
-	endPos := idx + len(srv.store.AuthHeader)
-	if endPos != len(hdrBlock) && hdrBlock[endPos] != '\r' {
-		return false
-	}
-	p := idx - 1
-	for p >= 0 && (hdrBlock[p] == ' ' || hdrBlock[p] == '\t') {
-		p--
-	}
-	if p < 13 || hdrBlock[p] != ':' || !equalFoldASCII(hdrBlock[p-13:p], hdrAuthorization) {
-		return false
-	}
-	return p-13 == 0 || hdrBlock[p-14] == '\n'
-}
-
-func (srv *Server) processBuffered(epfd int, c *connState) {
+func (w *epollWorker) processBuffered(c *connState) {
+	srv := w.srv
 	for c.wPos > c.rPos {
 		hdrRel := bytes.Index(c.buf[c.rPos:c.wPos], hdrDelimCRLFCRLF)
 		if hdrRel < 0 {
@@ -478,7 +487,6 @@ func (srv *Server) processBuffered(epfd int, c *connState) {
 		reqBytes := c.buf[c.rPos:hdrEnd]
 		bodyStart := hdrEnd + 4
 
-		// Parse request line: METHOD SP TARGET SP HTTP/1.x
 		firstNL := bytes.IndexByte(reqBytes, '\r')
 		var reqLine []byte
 		var hdrBlock []byte
@@ -492,155 +500,38 @@ func (srv *Server) processBuffered(epfd int, c *connState) {
 		}
 		sp1 := bytes.IndexByte(reqLine, ' ')
 		if sp1 <= 0 {
-			srv.closeConn(c)
+			w.closeConn(c)
 			return
 		}
 		method := reqLine[:sp1]
 		restLine := reqLine[sp1+1:]
 		sp2 := bytes.IndexByte(restLine, ' ')
 		if sp2 <= 0 {
-			srv.closeConn(c)
+			w.closeConn(c)
 			return
 		}
 		target := restLine[:sp2]
 
-		// ULTRA-HOT SIMD GET FAST PATHS (0 header loop, 0 alloc, 0 lock!)
-		if len(method) == 3 && method[0] == 'G' && method[1] == 'E' && method[2] == 'T' {
-			// Fast Path A: GET /api/v3/repos/{owner}/{repo}/issues/{num}
-			if len(target) > 22 && bytes.HasPrefix(target, prefixReposAPI) && bytes.IndexByte(target, '?') < 0 {
-				rest := target[14:]
-				if s1 := bytes.IndexByte(rest, '/'); s1 > 0 {
-					rest2 := rest[s1+1:]
-					if s2 := bytes.IndexByte(rest2, '/'); s2 > 0 {
-						tail := rest2[s2:]
-						if len(tail) > 8 && bytes.HasPrefix(tail, prefixIssuesSlash) && bytes.IndexByte(tail[8:], '/') < 0 {
-							if num, ok := parsePositiveIntBytes(tail[8:]); ok {
-								if srv.verifyAuthSIMD(hdrBlock) && bytes.Index(hdrBlock, hdrClose) < 0 && bytes.Index(hdrBlock, hdrCloseTitle) < 0 {
-									r := c.lookupRepo(srv, rest[:s1], rest2[:s2])
-									resp := srv.FastGetIssueHTTP(r, num)
-									c.rPos = bodyStart
-									if c.rPos == c.wPos {
-										c.rPos = 0
-										c.wPos = 0
-									}
-									if !srv.sendResp(epfd, c, resp, false) {
-										return
-									}
-									continue
-								}
-							}
-						}
-					}
-				}
+		if resp, handled := srv.tryFastGET(c, method, target, hdrBlock); handled {
+			c.rPos = bodyStart
+			if c.rPos == c.wPos {
+				c.rPos = 0
+				c.wPos = 0
 			}
-
-			// Fast Path B1: GET /{owner}/{repo}.git/info/refs?service=git-upload-pack (v2)
-			if len(target) > len(suffixInfoRefsUpload)+2 && target[0] == '/' && bytes.HasSuffix(target, suffixInfoRefsUpload) {
-				if srv.verifyAuthSIMD(hdrBlock) && bytes.Index(hdrBlock, hdrClose) < 0 && bytes.Index(hdrBlock, hdrCloseTitle) < 0 {
-					if bytes.Index(hdrBlock, hdrGitProtoV2Title) >= 0 || bytes.Index(hdrBlock, hdrGitProtoV2Lower) >= 0 {
-						prefix := target[1 : len(target)-len(suffixInfoRefsUpload)]
-						if slash := bytes.IndexByte(prefix, '/'); slash > 0 {
-							if c.lookupRepo(srv, prefix[:slash], prefix[slash+1:]) != nil {
-								c.rPos = bodyStart
-								if c.rPos == c.wPos {
-									c.rPos = 0
-									c.wPos = 0
-								}
-								if !srv.sendResp(epfd, c, staticUploadPackV2AdvHTTP, false) {
-									return
-								}
-								continue
-							}
-						}
-					}
-				}
+			if !w.sendResp(c, resp, false) {
+				return
 			}
-
-			// Fast Path B2: GET /{owner}/{repo}.git/info/refs?service=git-receive-pack
-			if len(target) > len(suffixInfoRefsRecv)+2 && target[0] == '/' && bytes.HasSuffix(target, suffixInfoRefsRecv) {
-				if srv.verifyAuthSIMD(hdrBlock) && bytes.Index(hdrBlock, hdrClose) < 0 && bytes.Index(hdrBlock, hdrCloseTitle) < 0 {
-					prefix := target[1 : len(target)-len(suffixInfoRefsRecv)]
-					if slash := bytes.IndexByte(prefix, '/'); slash > 0 {
-						if r := c.lookupRepo(srv, prefix[:slash], prefix[slash+1:]); r != nil {
-							if p := r.recvRefsCache.Load(); p != nil {
-								c.rPos = bodyStart
-								if c.rPos == c.wPos {
-									c.rPos = 0
-									c.wPos = 0
-								}
-								if !srv.sendResp(epfd, c, *p, false) {
-									return
-								}
-								continue
-							}
-						}
-					}
-				}
-			}
+			continue
 		}
 
-		// General header loop (zero allocation)
-		var authHdr []byte
-		var hostHdr []byte
-		var gitProto []byte
-		contentLen := 0
-		chunked := false
-		closeConn := false
+		authHdr, hostHdr, gitProto, contentLen, chunked, closeConn := parseHeaders(hdrBlock)
 
-		hPos := 0
-		for hPos < len(hdrBlock) {
-			nl := bytes.IndexByte(hdrBlock[hPos:], '\r')
-			var line []byte
-			if nl < 0 {
-				line = hdrBlock[hPos:]
-				hPos = len(hdrBlock)
-			} else {
-				line = hdrBlock[hPos : hPos+nl]
-				hPos += nl + 2
-			}
-			colon := bytes.IndexByte(line, ':')
-			if colon <= 0 {
-				continue
-			}
-			k := line[:colon]
-			v := bytes.TrimSpace(line[colon+1:])
-			switch len(k) {
-			case 4:
-				if (k[0] == 'H' || k[0] == 'h') && equalFoldASCII(k, hdrHost) {
-					hostHdr = v
-				}
-			case 10:
-				if (k[0] == 'C' || k[0] == 'c') && equalFoldASCII(k, hdrConnection) && equalFoldASCII(v, hdrClose) {
-					closeConn = true
-				}
-			case 12:
-				if (k[0] == 'G' || k[0] == 'g') && equalFoldASCII(k, hdrGitProto) {
-					gitProto = v
-				}
-			case 13:
-				if (k[0] == 'A' || k[0] == 'a') && equalFoldASCII(k, hdrAuthorization) {
-					authHdr = v
-				}
-			case 14:
-				if (k[0] == 'C' || k[0] == 'c') && equalFoldASCII(k, hdrContentLength) {
-					if cl, ok := parseNonNegIntBytes(v); ok {
-						contentLen = cl
-					}
-				}
-			case 17:
-				if (k[0] == 'T' || k[0] == 't') && equalFoldASCII(k, hdrTransferEnc) && containsFoldASCII(v, valChunked) {
-					chunked = true
-				}
-			}
-		}
-
-		// Ensure complete body is buffered before dispatching (never blocks!)
 		var body []byte
 		nextRPos := bodyStart
 		if chunked {
 			decoded, consumed, ok, bad := parseChunkedComplete(c.buf[bodyStart:c.wPos])
 			if bad {
-				srv.closeConn(c)
+				w.closeConn(c)
 				return
 			}
 			if !ok {
@@ -649,7 +540,7 @@ func (srv *Server) processBuffered(epfd int, c *connState) {
 					c.wPos -= c.rPos
 					c.rPos = 0
 				}
-				if srv.drainMoreInto(c, len(c.buf)) {
+				if w.drainMore(c) {
 					continue
 				}
 				return
@@ -674,7 +565,7 @@ func (srv *Server) processBuffered(epfd int, c *connState) {
 					copy(nb, c.buf[:c.wPos])
 					c.buf = nb
 				}
-				if srv.drainUntil(c, needTotal) {
+				if w.drainUntil(c, needTotal) {
 					continue
 				}
 				return
@@ -683,26 +574,26 @@ func (srv *Server) processBuffered(epfd int, c *connState) {
 			nextRPos = bodyStart + contentLen
 		}
 
-		resp := srv.dispatchRequest(c, method, target, authHdr, hostHdr, gitProto, body, srv.scratch)
+		resp := srv.dispatchRequest(c, method, target, authHdr, hostHdr, gitProto, body, w.scratch)
 		c.rPos = nextRPos
 		if c.rPos == c.wPos {
 			c.rPos = 0
 			c.wPos = 0
 		}
-		if !srv.sendResp(epfd, c, resp, closeConn) {
+		if !w.sendResp(c, resp, closeConn) {
 			return
 		}
 	}
 }
 
-func (srv *Server) drainUntil(c *connState, needTotal int) bool {
+func (w *epollWorker) drainUntil(c *connState, needTotal int) bool {
 	for c.wPos < needTotal {
-		n, errno := rawNonBlockRead(c.fd, c.buf[c.wPos:])
+		n, errno := rawReadFD(c.fd, c.buf[c.wPos:])
 		if errno == syscall.EAGAIN {
 			return false
 		}
 		if errno != 0 || n == 0 {
-			srv.closeConn(c)
+			w.closeConn(c)
 			return false
 		}
 		c.wPos += n
@@ -710,7 +601,7 @@ func (srv *Server) drainUntil(c *connState, needTotal int) bool {
 	return true
 }
 
-func (srv *Server) drainMoreInto(c *connState, _ int) bool {
+func (w *epollWorker) drainMore(c *connState) bool {
 	readAny := false
 	for {
 		if c.wPos == len(c.buf) {
@@ -718,17 +609,140 @@ func (srv *Server) drainMoreInto(c *connState, _ int) bool {
 			copy(nb, c.buf[:c.wPos])
 			c.buf = nb
 		}
-		n, errno := rawNonBlockRead(c.fd, c.buf[c.wPos:])
+		n, errno := rawReadFD(c.fd, c.buf[c.wPos:])
 		if errno == syscall.EAGAIN {
 			return readAny
 		}
 		if errno != 0 || n == 0 {
-			srv.closeConn(c)
+			w.closeConn(c)
 			return false
 		}
 		c.wPos += n
 		readAny = true
 	}
+}
+
+func (srv *Server) verifyAuthSIMD(hdrBlock []byte) bool {
+	if srv.store.Token == "" {
+		return true
+	}
+	idx := bytes.Index(hdrBlock, srv.store.AuthHeader)
+	if idx < 15 {
+		return false
+	}
+	endPos := idx + len(srv.store.AuthHeader)
+	if endPos != len(hdrBlock) && hdrBlock[endPos] != '\r' {
+		return false
+	}
+	p := idx - 1
+	for p >= 0 && (hdrBlock[p] == ' ' || hdrBlock[p] == '\t') {
+		p--
+	}
+	if p < 13 || hdrBlock[p] != ':' || !equalFoldASCII(hdrBlock[p-13:p], hdrAuthorization) {
+		return false
+	}
+	return p-13 == 0 || hdrBlock[p-14] == '\n'
+}
+
+func (srv *Server) tryFastGET(c *connState, method, target, hdrBlock []byte) ([]byte, bool) {
+	if len(method) != 3 || method[0] != 'G' || method[1] != 'E' || method[2] != 'T' {
+		return nil, false
+	}
+	// Fast Path A: GET /api/v3/repos/{owner}/{repo}/issues/{num}
+	if len(target) > 22 && bytes.HasPrefix(target, prefixReposAPI) && bytes.IndexByte(target, '?') < 0 {
+		rest := target[14:]
+		if s1 := bytes.IndexByte(rest, '/'); s1 > 0 {
+			rest2 := rest[s1+1:]
+			if s2 := bytes.IndexByte(rest2, '/'); s2 > 0 {
+				tail := rest2[s2:]
+				if len(tail) > 8 && bytes.HasPrefix(tail, prefixIssuesSlash) && bytes.IndexByte(tail[8:], '/') < 0 {
+					if num, ok := parsePositiveIntBytes(tail[8:]); ok {
+						if srv.verifyAuthSIMD(hdrBlock) && bytes.Index(hdrBlock, hdrClose) < 0 && bytes.Index(hdrBlock, hdrCloseTitle) < 0 {
+							r := c.lookupRepo(srv, rest[:s1], rest2[:s2])
+							return srv.FastGetIssueHTTP(r, num), true
+						}
+					}
+				}
+			}
+		}
+	}
+	// Fast Path B1: GET /{owner}/{repo}.git/info/refs?service=git-upload-pack (v2)
+	if len(target) > len(suffixInfoRefsUpload)+2 && target[0] == '/' && bytes.HasSuffix(target, suffixInfoRefsUpload) {
+		if srv.verifyAuthSIMD(hdrBlock) && bytes.Index(hdrBlock, hdrClose) < 0 && bytes.Index(hdrBlock, hdrCloseTitle) < 0 {
+			if bytes.Index(hdrBlock, hdrGitProtoV2Title) >= 0 || bytes.Index(hdrBlock, hdrGitProtoV2Lower) >= 0 {
+				prefix := target[1 : len(target)-len(suffixInfoRefsUpload)]
+				if slash := bytes.IndexByte(prefix, '/'); slash > 0 {
+					if c.lookupRepo(srv, prefix[:slash], prefix[slash+1:]) != nil {
+						return staticUploadPackV2AdvHTTP, true
+					}
+				}
+			}
+		}
+	}
+	// Fast Path B2: GET /{owner}/{repo}.git/info/refs?service=git-receive-pack
+	if len(target) > len(suffixInfoRefsRecv)+2 && target[0] == '/' && bytes.HasSuffix(target, suffixInfoRefsRecv) {
+		if srv.verifyAuthSIMD(hdrBlock) && bytes.Index(hdrBlock, hdrClose) < 0 && bytes.Index(hdrBlock, hdrCloseTitle) < 0 {
+			prefix := target[1 : len(target)-len(suffixInfoRefsRecv)]
+			if slash := bytes.IndexByte(prefix, '/'); slash > 0 {
+				if r := c.lookupRepo(srv, prefix[:slash], prefix[slash+1:]); r != nil {
+					if p := r.recvRefsCache.Load(); p != nil {
+						return *p, true
+					}
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+func parseHeaders(hdrBlock []byte) (authHdr, hostHdr, gitProto []byte, contentLen int, chunked, closeConn bool) {
+	hPos := 0
+	for hPos < len(hdrBlock) {
+		nl := bytes.IndexByte(hdrBlock[hPos:], '\r')
+		var line []byte
+		if nl < 0 {
+			line = hdrBlock[hPos:]
+			hPos = len(hdrBlock)
+		} else {
+			line = hdrBlock[hPos : hPos+nl]
+			hPos += nl + 2
+		}
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 {
+			continue
+		}
+		k := line[:colon]
+		v := bytes.TrimSpace(line[colon+1:])
+		switch len(k) {
+		case 4:
+			if (k[0] == 'H' || k[0] == 'h') && equalFoldASCII(k, hdrHost) {
+				hostHdr = v
+			}
+		case 10:
+			if (k[0] == 'C' || k[0] == 'c') && equalFoldASCII(k, hdrConnection) && equalFoldASCII(v, hdrClose) {
+				closeConn = true
+			}
+		case 12:
+			if (k[0] == 'G' || k[0] == 'g') && equalFoldASCII(k, hdrGitProto) {
+				gitProto = v
+			}
+		case 13:
+			if (k[0] == 'A' || k[0] == 'a') && equalFoldASCII(k, hdrAuthorization) {
+				authHdr = v
+			}
+		case 14:
+			if (k[0] == 'C' || k[0] == 'c') && equalFoldASCII(k, hdrContentLength) {
+				if cl, ok := parseNonNegIntBytes(v); ok {
+					contentLen = cl
+				}
+			}
+		case 17:
+			if (k[0] == 'T' || k[0] == 't') && equalFoldASCII(k, hdrTransferEnc) && containsFoldASCII(v, valChunked) {
+				chunked = true
+			}
+		}
+	}
+	return
 }
 
 func parseChunkedComplete(data []byte) ([]byte, int, bool, bool) {
@@ -755,7 +769,6 @@ func parseChunkedComplete(data []byte) ([]byte, int, bool, bool) {
 			if data[pos] == '\r' && data[pos+1] == '\n' {
 				return decoded, pos + 2, true, false
 			}
-			// Optional trailers ending with \r\n\r\n
 			endTr := bytes.Index(data[pos:], hdrDelimCRLFCRLF)
 			if endTr < 0 {
 				return nil, 0, false, false
@@ -775,7 +788,6 @@ func (srv *Server) dispatchRequest(
 	c *connState,
 	method, target, authHdr, hostHdr, gitProto, body, scratch []byte,
 ) []byte {
-	// Split path and query
 	path := target
 	var query []byte
 	if qIdx := bytes.IndexByte(target, '?'); qIdx >= 0 {
@@ -783,20 +795,16 @@ func (srv *Server) dispatchRequest(
 		query = target[qIdx+1:]
 	}
 
-	// 1. /healthz (unauthenticated)
 	if len(path) == 8 && bytes.Equal(path, pathHealthz) {
 		return respHealthzHTTP
 	}
 
-	// 2. Bearer auth check (all surfaces require token when MAKEFUN_SHOP_TOKEN is set)
 	if srv.store.Token != "" {
 		if !bytes.Equal(authHdr, srv.store.AuthHeader) {
 			return respUnauthorized
 		}
 	}
 
-	// 3. ULTRA-HOT FAST PATHS (ZERO ALLOCATION!)
-	// 3a. /api/v3/repos/{owner}/{repo}/issues[/{num}]
 	if len(path) > 14 && bytes.HasPrefix(path, prefixReposAPI) {
 		rest := path[14:]
 		s1 := bytes.IndexByte(rest, '/')
@@ -807,7 +815,6 @@ func (srv *Server) dispatchRequest(
 			if s2 > 0 {
 				repoName := rest2[:s2]
 				tail := rest2[s2:]
-				// Fast GET /issues/{num}
 				if len(method) == 3 && method[0] == 'G' && len(tail) > 8 && bytes.HasPrefix(tail, prefixIssuesSlash) {
 					numBytes := tail[8:]
 					if bytes.IndexByte(numBytes, '/') < 0 {
@@ -816,7 +823,6 @@ func (srv *Server) dispatchRequest(
 						}
 					}
 				}
-				// Fast POST /issues
 				if len(method) == 4 && method[0] == 'P' && method[1] == 'O' && bytes.Equal(tail, pathIssuesExact) {
 					return srv.FastCreateIssueHTTP(c.lookupRepo(srv, owner, repoName), body, scratch)
 				}
@@ -825,12 +831,10 @@ func (srv *Server) dispatchRequest(
 		return srv.handleREST(string(method), string(path), string(query), string(hostHdr), body)
 	}
 
-	// 3b. /api/v3...
 	if bytes.HasPrefix(path, prefixAPIV3) {
 		return srv.handleREST(string(method), string(path), string(query), string(hostHdr), body)
 	}
 
-	// 3c. /api/graphql
 	if bytes.Equal(path, pathGraphQL) {
 		if !bytes.Equal(method, methodPOST) {
 			return respNotFoundJSON
@@ -838,7 +842,6 @@ func (srv *Server) dispatchRequest(
 		return srv.handleGraphQL(body)
 	}
 
-	// 3d. /mcp
 	if bytes.Equal(path, pathMCP) {
 		if !bytes.Equal(method, methodPOST) {
 			return respNotFoundJSON
@@ -846,7 +849,6 @@ func (srv *Server) dispatchRequest(
 		return srv.handleMCP(body)
 	}
 
-	// 3e. Git Smart HTTP: /{owner}/{repo}.git/...
 	if len(path) > 1 && path[0] == '/' {
 		if gitIdx := bytes.Index(path, dotGitSlash); gitIdx > 0 {
 			prefix := path[1:gitIdx]

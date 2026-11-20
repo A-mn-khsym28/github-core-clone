@@ -111,6 +111,7 @@ type Repo struct {
 
 	// Git store
 	Objects      map[[20]byte]*GitObject
+	hasPending   atomic.Bool
 	pendingPacks [][]byte // Deferred raw pack bodies (without 20B trailer) materialized lazily on object reads
 	Refs         map[string][20]byte
 	RefGen       uint64
@@ -118,8 +119,9 @@ type Repo struct {
 
 	// Atomic hot-path HTTP response caches (complete HTTP/1.1 bytes, 100% lock-free reads!)
 	recvRefsCache     atomic.Pointer[[]byte]
-	recvMainHTTP      []byte // Reusable single-ref HTTP/1.1 response updated in-place on push
+	recvMainHTTP      [2][]byte // Ping-pong reusable single-ref HTTP/1.1 buffers updated in-place
 	recvMainOIDOfs    int
+	recvMainSlot      int
 	lsRefsCache       atomic.Pointer[[]byte]
 	lsRefsReqCache    atomic.Pointer[RawReqRespCache]
 	fetchReqCache     atomic.Pointer[RawReqRespCache]
@@ -257,7 +259,11 @@ func (s *Store) GetRepo(owner, name string) *Repo {
 		return nil
 	}
 	m := s.reposSnap.Load()
-	return (*m)[name]
+	r := (*m)[name]
+	if r != nil {
+		r.ensureMaterialized()
+	}
+	return r
 }
 
 func (s *Store) GetRepoBytes(owner, name []byte) *Repo {
@@ -616,7 +622,6 @@ func encodeTree(entries []TreeEntry) []byte {
 
 // FlattenTreeLocked maps repo-relative file path -> blob OID.
 func (r *Repo) FlattenTreeLocked(treeOID [20]byte) map[string][20]byte {
-	r.ensureMaterializedLocked()
 	files := make(map[string][20]byte)
 	var walk func(oid [20]byte, prefix string)
 	walk = func(oid [20]byte, prefix string) {
@@ -690,7 +695,6 @@ func (r *Repo) BuildTreeFromFilesLocked(files map[string][20]byte) [20]byte {
 }
 
 func (r *Repo) ResolveTreeEntryLocked(treeOID [20]byte, path string) (*TreeEntry, [20]byte, bool) {
-	r.ensureMaterializedLocked()
 	path = strings.Trim(path, "/")
 	if path == "" {
 		return nil, treeOID, treeOID != ZeroOID
@@ -750,7 +754,6 @@ func (r *Repo) CreateCommitLocked(treeOID [20]byte, parents [][20]byte, message,
 }
 
 func (r *Repo) MergeBaseLocked(a, b [20]byte) [20]byte {
-	r.ensureMaterializedLocked()
 	if a == b {
 		return a
 	}
@@ -795,7 +798,6 @@ func (r *Repo) MergeBaseLocked(a, b [20]byte) [20]byte {
 }
 
 func (r *Repo) TreeForCommitLocked(commitOID [20]byte) [20]byte {
-	r.ensureMaterializedLocked()
 	if commitOID == ZeroOID {
 		return ZeroOID
 	}
